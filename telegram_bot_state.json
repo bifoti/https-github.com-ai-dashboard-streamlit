@@ -1,0 +1,36 @@
+{
+    "promo_status": "PROFITABLE",
+    "main_product": "Ayam Bakar Madu",
+    "combo_product": "Kulit Ayam Crispy",
+    "discount_rate": 10,
+    "expected_uplift": 20,
+    "target_bundle_qty": 100,
+    "bundle_price_before_discount": "RM 47.87",
+    "bundle_price_after_discount": "RM 43.08",
+    "estimated_revenue": "RM 4,308.07",
+    "revenue_after_uplift": "RM 5,169.68",
+    "net_promo_impact": "RM 382.94",
+    "ai_suggestion": "This combo promotion is recommended because the estimated net impact is positive. The business can test this combo during peak hours or lunch/dinner promotion.",
+    "top_combos": [
+        {
+            "Recommended Combo Item": "Kulit Ayam Crispy",
+            "Frequency": 5420
+        },
+        {
+            "Recommended Combo Item": "Bebek Goreng Surabaya",
+            "Frequency": 5405
+        },
+        {
+            "Recommended Combo Item": "Es Jeruk",
+            "Frequency": 5372
+        },
+        {
+            "Recommended Combo Item": "Nasi Putih",
+            "Frequency": 5364
+        },
+        {
+            "Recommended Combo Item": "Es Teh Manis",
+            "Frequency": 5359
+        }
+    ]
+}
