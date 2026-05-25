@@ -2,9 +2,11 @@ import streamlit as st
 import pandas as pd
 import joblib
 import matplotlib.pyplot as plt
-import telebot
 import json
 import os
+from datetime import datetime, timedelta
+import telebot
+from sklearn.ensemble import RandomForestRegressor
 
 # =========================
 # LOAD DATA
@@ -14,6 +16,55 @@ latest_values = joblib.load("latest_values.pkl")
 
 df = pd.read_csv("AyamSerayu_3Years_Transaction_Data.csv")
 df["Tanggal & Waktu"] = pd.to_datetime(df["Tanggal & Waktu"])
+
+
+# =========================
+# TELEGRAM CONFIG
+# =========================
+# Replace this token with your real token from @BotFather.
+# The bot file will register users and save their chat_id into users.json.
+BOT_TOKEN = "YOUR_BOT_TOKEN"
+USERS_FILE = "users.json"
+LATEST_RESTOCK_FILE = "latest_restocking_alert.json"
+
+try:
+    telegram_bot = telebot.TeleBot(BOT_TOKEN)
+except Exception:
+    telegram_bot = None
+
+
+def ensure_json_file(filename, default_data):
+    if not os.path.exists(filename):
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(default_data, f, indent=4)
+
+
+def load_registered_users():
+    ensure_json_file(USERS_FILE, {})
+    with open(USERS_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def send_telegram_alert(chat_id, message):
+    if BOT_TOKEN == "YOUR_BOT_TOKEN":
+        st.warning("Please set BOT_TOKEN first.")
+        return False
+
+    if telegram_bot is None:
+        st.warning("Telegram bot is not ready.")
+        return False
+
+    try:
+        telegram_bot.send_message(chat_id, message)
+        return True
+    except Exception as e:
+        st.error(f"Telegram alert failed: {e}")
+        return False
+
+
+def save_latest_restock_alert(data):
+    with open(LATEST_RESTOCK_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, default=str)
 
 # =========================
 # PAGE CONFIG
@@ -50,38 +101,6 @@ def format_idr(value):
 
 def rm(value):
     return format_currency(value)
-
-
-# =========================
-# TELEGRAM BOT SETTING
-# =========================
-# 1. Get BOT_TOKEN from @BotFather
-# 2. Get CHAT_ID from https://api.telegram.org/botYOUR_BOT_TOKEN/getUpdates
-BOT_TOKEN = "8876275131:AAFqLliTehn630SesjjHaV9J4f4K18EGkC0"
-CHAT_ID = "7816636283"
-BOT_STATE_FILE = "telegram_bot_state.json"
-
-
-def get_telegram_bot():
-    if BOT_TOKEN == "YOUR_BOT_TOKEN":
-        return None
-    return telebot.TeleBot(BOT_TOKEN)
-
-
-def send_telegram_notification(message):
-    bot = get_telegram_bot()
-
-    if bot is None or CHAT_ID == "YOUR_CHAT_ID":
-        st.error("Please set BOT_TOKEN and CHAT_ID first.")
-        return False
-
-    bot.send_message(CHAT_ID, message)
-    return True
-
-
-def save_telegram_state(data):
-    with open(BOT_STATE_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4, ensure_ascii=False)
 
 # =========================
 # CUSTOM CSS
@@ -229,6 +248,191 @@ def product_sales_summary(product_name):
         "avg_basket_myr": avg_basket_myr
     }
 
+
+# =========================
+# AI RESTOCKING MODEL FUNCTIONS
+# =========================
+INGREDIENT_COLUMNS = [
+    "Chicken_kg",
+    "Rice_kg",
+    "Drink_units",
+    "Chili_kg",
+    "Oil_liter",
+    "Egg_units"
+]
+
+
+def format_ingredient_name(name):
+    return (
+        name.replace("_kg", " (kg)")
+        .replace("_units", " (units)")
+        .replace("_liter", " (liter)")
+        .replace("_", " ")
+    )
+
+
+def estimate_recipe_from_product_name(product_name):
+    """
+    Recipe mapping assumption per 1 item sold.
+    This is only used to convert product sales into ingredient usage.
+    The monthly demand itself is predicted by RandomForestRegressor.
+    """
+    name = str(product_name).lower()
+
+    recipe = {
+        "Chicken_kg": 0.0,
+        "Rice_kg": 0.0,
+        "Drink_units": 0.0,
+        "Chili_kg": 0.0,
+        "Oil_liter": 0.0,
+        "Egg_units": 0.0
+    }
+
+    if any(word in name for word in ["ayam", "chicken", "geprek", "bakar", "crispy"]):
+        recipe["Chicken_kg"] = 0.22
+        recipe["Chili_kg"] = 0.015
+        recipe["Oil_liter"] = 0.02
+
+    if any(word in name for word in ["nasi", "rice", "paket"]):
+        recipe["Rice_kg"] = 0.18
+
+    if any(word in name for word in ["teh", "es", "air", "kopi", "jeruk", "drink", "minum"]):
+        recipe["Drink_units"] = 1.0
+
+    if any(word in name for word in ["telur", "egg"]):
+        recipe["Egg_units"] = 1.0
+
+    return recipe
+
+
+def build_recipe_map(data):
+    products = sorted(data["Nama Produk"].dropna().unique())
+    return {
+        product: estimate_recipe_from_product_name(product)
+        for product in products
+    }
+
+
+def create_monthly_ingredient_usage(data, recipe_map):
+    working_df = data.copy()
+    working_df["Tanggal & Waktu"] = pd.to_datetime(working_df["Tanggal & Waktu"])
+    working_df["year"] = working_df["Tanggal & Waktu"].dt.year
+    working_df["month"] = working_df["Tanggal & Waktu"].dt.month
+
+    if "Jumlah" not in working_df.columns:
+        working_df["Jumlah"] = 1
+
+    for ingredient in INGREDIENT_COLUMNS:
+        working_df[ingredient] = working_df.apply(
+            lambda row: recipe_map.get(row["Nama Produk"], {}).get(ingredient, 0) * row["Jumlah"],
+            axis=1
+        )
+
+    monthly_usage = (
+        working_df.groupby(["year", "month"])[INGREDIENT_COLUMNS]
+        .sum()
+        .reset_index()
+        .sort_values(["year", "month"])
+    )
+
+    return monthly_usage
+
+
+def add_monthly_ai_features(monthly_usage):
+    monthly_df = monthly_usage.copy()
+
+    for ingredient in INGREDIENT_COLUMNS:
+        monthly_df[f"lag_1_{ingredient}"] = monthly_df[ingredient].shift(1)
+        monthly_df[f"rolling_mean_3_{ingredient}"] = monthly_df[ingredient].rolling(3).mean()
+
+    monthly_df["month_sin"] = monthly_df["month"].apply(
+        lambda x: __import__("math").sin(2 * __import__("math").pi * x / 12)
+    )
+    monthly_df["month_cos"] = monthly_df["month"].apply(
+        lambda x: __import__("math").cos(2 * __import__("math").pi * x / 12)
+    )
+
+    monthly_df = monthly_df.dropna()
+    return monthly_df
+
+
+@st.cache_resource
+def train_inventory_model(data_rows, min_date, max_date):
+    recipe_map = build_recipe_map(df)
+    monthly_usage = create_monthly_ingredient_usage(df, recipe_map)
+    monthly_features = add_monthly_ai_features(monthly_usage)
+
+    if len(monthly_features) < 3:
+        return None, recipe_map, monthly_usage, None, None
+
+    feature_cols = ["year", "month", "month_sin", "month_cos"]
+
+    for ingredient in INGREDIENT_COLUMNS:
+        feature_cols.append(f"lag_1_{ingredient}")
+        feature_cols.append(f"rolling_mean_3_{ingredient}")
+
+    X = monthly_features[feature_cols]
+    y = monthly_features[INGREDIENT_COLUMNS]
+
+    inventory_model = RandomForestRegressor(
+        n_estimators=250,
+        random_state=42
+    )
+
+    inventory_model.fit(X, y)
+
+    latest_month = monthly_usage.iloc[-1]
+
+    return inventory_model, recipe_map, monthly_usage, latest_month, feature_cols
+
+
+def detect_seasonal_event(simulated_today, forecast_month):
+    simulated_today = pd.to_datetime(simulated_today)
+
+    event_name = "Normal Demand"
+    multiplier = 1.0
+    confidence = 70
+
+    if forecast_month in [3, 4]:
+        event_name = "Hari Raya Seasonal Demand"
+        multiplier = 1.45
+        confidence = 88
+    elif simulated_today.day >= 25:
+        event_name = "Salary Week Demand Surge"
+        multiplier = 1.25
+        confidence = 82
+    elif simulated_today.weekday() in [4, 5]:
+        event_name = "Weekend Demand Spike"
+        multiplier = 1.15
+        confidence = 76
+
+    return event_name, multiplier, confidence
+
+
+def predict_monthly_ingredient_demand(inventory_model, latest_month, feature_cols, forecast_year, forecast_month, seasonal_multiplier):
+    import math
+
+    input_data = {
+        "year": [forecast_year],
+        "month": [forecast_month],
+        "month_sin": [math.sin(2 * math.pi * forecast_month / 12)],
+        "month_cos": [math.cos(2 * math.pi * forecast_month / 12)]
+    }
+
+    for ingredient in INGREDIENT_COLUMNS:
+        latest_value = latest_month[ingredient]
+        input_data[f"lag_1_{ingredient}"] = [latest_value]
+        input_data[f"rolling_mean_3_{ingredient}"] = [latest_value]
+
+    X_future = pd.DataFrame(input_data)[feature_cols]
+    prediction = inventory_model.predict(X_future)[0]
+
+    result = {}
+    for ingredient, value in zip(INGREDIENT_COLUMNS, prediction):
+        result[ingredient] = max(round(value * seasonal_multiplier, 2), 0)
+
+    return result
+
 # =========================
 # HEADER
 # =========================
@@ -247,7 +451,7 @@ st.markdown(
 # =========================
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Combo Control"]
+    ["Dashboard", "Combo Control", "AI Restocking Demo"]
 )
 
 st.sidebar.divider()
@@ -567,85 +771,6 @@ if page == "Combo Control":
         uplift_gain_idr = estimated_revenue_after_uplift_idr - estimated_revenue_idr
         net_impact_idr = uplift_gain_idr - discount_loss_idr
 
-    # =========================
-    # AI PROMOTION SUGGESTION FOR TELEGRAM
-    # =========================
-    if net_impact_idr > 0:
-        promo_status = "PROFITABLE"
-        ai_suggestion = (
-            "This combo promotion is recommended because the estimated net impact is positive. "
-            "The business can test this combo during peak hours or lunch/dinner promotion."
-        )
-    elif net_impact_idr < 0:
-        promo_status = "RISKY"
-        ai_suggestion = (
-            "This combo promotion may reduce revenue. Try lowering the discount, increasing target quantity, "
-            "or choosing another combo item with higher purchase frequency."
-        )
-    else:
-        promo_status = "BREAK EVEN"
-        ai_suggestion = (
-            "This combo promotion is estimated to break even. Adjust the discount or expected uplift "
-            "to improve the promotion impact."
-        )
-
-    telegram_message = f"""
-🤖 AI Combo Promotion Suggestion
-
-Status: {promo_status}
-
-Main Product:
-{main_product}
-
-Combo Product:
-{combo_product}
-
-Discount:
-{discount_rate}%
-
-Expected Uplift:
-{expected_uplift}%
-
-Target Combo Quantity:
-{target_bundle_qty:,}
-
-Bundle Price Before Discount:
-{rm(bundle_price_idr)}
-
-Bundle Price After Discount:
-{rm(discounted_bundle_price_idr)}
-
-Estimated Revenue:
-{rm(estimated_revenue_idr)}
-
-Revenue After Uplift:
-{rm(estimated_revenue_after_uplift_idr)}
-
-Net Promo Impact:
-{rm(net_impact_idr)}
-
-AI Suggestion:
-{ai_suggestion}
-"""
-
-    latest_bot_state = {
-        "promo_status": promo_status,
-        "main_product": main_product,
-        "combo_product": combo_product,
-        "discount_rate": discount_rate,
-        "expected_uplift": expected_uplift,
-        "target_bundle_qty": int(target_bundle_qty),
-        "bundle_price_before_discount": rm(bundle_price_idr),
-        "bundle_price_after_discount": rm(discounted_bundle_price_idr),
-        "estimated_revenue": rm(estimated_revenue_idr),
-        "revenue_after_uplift": rm(estimated_revenue_after_uplift_idr),
-        "net_promo_impact": rm(net_impact_idr),
-        "ai_suggestion": ai_suggestion,
-        "top_combos": ai_combo_df.to_dict(orient="records")
-    }
-
-    save_telegram_state(latest_bot_state)
-
     st.divider()
 
     st.subheader("AI Combo Recommendation")
@@ -753,16 +878,279 @@ AI Suggestion:
 
     st.dataframe(detail_df, use_container_width=True)
 
-    st.divider()
 
-    st.subheader("Telegram AI Notification")
+# =========================
+# AI RESTOCKING DEMO PAGE
+# =========================
+if page == "AI Restocking Demo":
 
+    st.header("📦 AI Monthly Restocking Demo")
     st.write(
-        "Send the latest combo promotion analysis and AI suggestion to Telegram."
+        "This demo lets users enter current inventory stock and a simulated date. "
+        "The system trains an AI monthly ingredient demand model from the transaction dataset, "
+        "detects seasonal timing, suggests restocking date and quantity, then sends Telegram alerts."
     )
 
-    if st.button("Send AI Suggestion To Telegram"):
-        sent = send_telegram_notification(telegram_message)
+    st.divider()
 
-        if sent:
-            st.success("Telegram notification sent successfully.")
+    registered_users = load_registered_users()
+
+    st.subheader("Telegram Registered User")
+
+    if len(registered_users) == 0:
+        st.warning("No Telegram user registered yet. Open the Telegram bot and register first.")
+        st.code("/register AyamSerayu 0123456789")
+        selected_company = "Not Registered"
+        selected_chat_id = None
+    else:
+        selected_company = st.selectbox(
+            "Select Registered Company",
+            list(registered_users.keys())
+        )
+        selected_chat_id = registered_users[selected_company]["chat_id"]
+        st.success(f"Telegram connected for: {selected_company}")
+
+    st.divider()
+
+    st.subheader("1. Simulated Timeframe")
+
+    tf1, tf2, tf3 = st.columns(3)
+
+    with tf1:
+        simulated_today = st.date_input(
+            "Simulated Today",
+            value=datetime.today()
+        )
+
+    with tf2:
+        forecast_month = st.selectbox(
+            "Forecast Month",
+            list(range(1, 13)),
+            index=datetime.today().month - 1
+        )
+
+    with tf3:
+        forecast_year = st.number_input(
+            "Forecast Year",
+            min_value=2025,
+            max_value=2035,
+            value=2026
+        )
+
+    supplier_lead_time = st.slider(
+        "Supplier Lead Time (days)",
+        min_value=1,
+        max_value=30,
+        value=5
+    )
+
+    st.divider()
+
+    st.subheader("2. Current Inventory Stock")
+
+    s1, s2, s3 = st.columns(3)
+
+    with s1:
+        current_chicken = st.number_input("Chicken Stock (kg)", min_value=0.0, value=80.0, step=5.0)
+        current_rice = st.number_input("Rice Stock (kg)", min_value=0.0, value=50.0, step=5.0)
+
+    with s2:
+        current_drink = st.number_input("Drink Stock (units)", min_value=0.0, value=150.0, step=10.0)
+        current_chili = st.number_input("Chili Stock (kg)", min_value=0.0, value=20.0, step=2.0)
+
+    with s3:
+        current_oil = st.number_input("Oil Stock (liter)", min_value=0.0, value=30.0, step=2.0)
+        current_egg = st.number_input("Egg Stock (units)", min_value=0.0, value=200.0, step=10.0)
+
+    current_stock = {
+        "Chicken_kg": current_chicken,
+        "Rice_kg": current_rice,
+        "Drink_units": current_drink,
+        "Chili_kg": current_chili,
+        "Oil_liter": current_oil,
+        "Egg_units": current_egg
+    }
+
+    st.divider()
+
+    st.subheader("3. AI Inventory Demand Model")
+
+    inventory_model, recipe_map, monthly_usage, latest_month, feature_cols = train_inventory_model(
+        len(df),
+        str(df["Tanggal & Waktu"].min()),
+        str(df["Tanggal & Waktu"].max())
+    )
+
+    with st.expander("View Auto Ingredient Mapping"):
+        mapping_rows = []
+        for product, recipe in recipe_map.items():
+            row = {"Product": product}
+            row.update(recipe)
+            mapping_rows.append(row)
+        st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
+
+    with st.expander("View Monthly Ingredient Usage Generated From Dataset"):
+        st.dataframe(monthly_usage, use_container_width=True)
+
+    if inventory_model is None:
+        st.error("Not enough monthly data to train inventory forecasting model.")
+    else:
+        st.success("AI monthly inventory forecasting model trained successfully from historical transaction data.")
+
+        seasonal_event, seasonal_multiplier, seasonal_confidence = detect_seasonal_event(
+            simulated_today,
+            forecast_month
+        )
+
+        predicted_demand = predict_monthly_ingredient_demand(
+            inventory_model,
+            latest_month,
+            feature_cols,
+            int(forecast_year),
+            int(forecast_month),
+            seasonal_multiplier
+        )
+
+        suggested_restock_date = pd.to_datetime(simulated_today) + timedelta(days=supplier_lead_time)
+
+        result_rows = []
+
+        for ingredient in INGREDIENT_COLUMNS:
+            restock_qty = max(
+                round(predicted_demand[ingredient] - current_stock[ingredient], 2),
+                0
+            )
+
+            shortage_percent = 0
+            if predicted_demand[ingredient] > 0:
+                shortage_percent = (restock_qty / predicted_demand[ingredient]) * 100
+
+            if shortage_percent >= 50:
+                priority = "HIGH"
+            elif shortage_percent >= 20:
+                priority = "MEDIUM"
+            elif restock_qty > 0:
+                priority = "LOW"
+            else:
+                priority = "SUFFICIENT"
+
+            result_rows.append({
+                "Ingredient": format_ingredient_name(ingredient),
+                "Current Stock": round(current_stock[ingredient], 2),
+                "AI Predicted Monthly Demand": round(predicted_demand[ingredient], 2),
+                "Recommended Restock Quantity": restock_qty,
+                "Priority": priority
+            })
+
+        result_df = pd.DataFrame(result_rows)
+
+        st.divider()
+        st.subheader("4. AI Restocking Recommendation")
+
+        r1, r2, r3 = st.columns(3)
+
+        with r1:
+            st.metric("Detected Seasonal Event", seasonal_event)
+
+        with r2:
+            st.metric("Seasonal Confidence", f"{seasonal_confidence}%")
+
+        with r3:
+            st.metric("Suggested Restocking Date", suggested_restock_date.strftime("%d %b %Y"))
+
+        st.dataframe(result_df, use_container_width=True)
+
+        if len(result_df[result_df["Priority"] == "HIGH"]) > 0:
+            st.error("High inventory risk detected. Immediate procurement action is recommended.")
+        elif len(result_df[result_df["Priority"] == "MEDIUM"]) > 0:
+            st.warning("Medium inventory risk detected. Restocking should be planned soon.")
+        else:
+            st.success("Inventory is mostly sufficient for the predicted monthly demand.")
+
+        st.divider()
+        st.subheader("5. Demand vs Stock Chart")
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.bar(result_df["Ingredient"], result_df["AI Predicted Monthly Demand"], label="AI Predicted Demand")
+        ax.plot(result_df["Ingredient"], result_df["Current Stock"], marker="o", label="Current Stock")
+        ax.set_title("Monthly Ingredient Demand vs Current Stock")
+        ax.set_xlabel("Ingredient")
+        ax.set_ylabel("Quantity")
+        ax.legend()
+        plt.xticks(rotation=20)
+        st.pyplot(fig)
+
+        st.divider()
+        st.subheader("6. Telegram AI Restocking Alert")
+
+        risky_items = result_df[result_df["Recommended Restock Quantity"] > 0].sort_values(
+            "Recommended Restock Quantity",
+            ascending=False
+        )
+
+        if len(risky_items) > 0:
+            main_suggestion = f"Restock {risky_items.iloc[0]['Ingredient']} first because it has the highest shortage risk."
+        else:
+            main_suggestion = "No urgent restocking required for this selected timeframe."
+
+        restock_lines = ""
+        for _, row in result_df.iterrows():
+            restock_lines += (
+                f"\n{row['Ingredient']}\n"
+                f"Current Stock: {row['Current Stock']}\n"
+                f"AI Demand: {row['AI Predicted Monthly Demand']}\n"
+                f"Recommended Restock: +{row['Recommended Restock Quantity']}\n"
+                f"Priority: {row['Priority']}\n"
+            )
+
+        telegram_message = f"""
+🤖 AI Seasonal Procurement Alert
+
+Company:
+{selected_company}
+
+Simulated Today:
+{pd.to_datetime(simulated_today).strftime('%d %b %Y')}
+
+Forecast Period:
+{forecast_month}/{forecast_year}
+
+Detected Event:
+{seasonal_event}
+
+Seasonal Confidence:
+{seasonal_confidence}%
+
+Suggested Restocking Date:
+{suggested_restock_date.strftime('%d %b %Y')}
+
+AI Restocking Recommendation:
+{restock_lines}
+
+Main Suggestion:
+{main_suggestion}
+"""
+
+        latest_alert = {
+            "company": selected_company,
+            "simulated_today": str(simulated_today),
+            "forecast_month": int(forecast_month),
+            "forecast_year": int(forecast_year),
+            "seasonal_event": seasonal_event,
+            "seasonal_confidence": seasonal_confidence,
+            "suggested_restock_date": str(suggested_restock_date.date()),
+            "recommendations": result_rows,
+            "main_suggestion": main_suggestion
+        }
+
+        save_latest_restock_alert(latest_alert)
+
+        st.text_area("Telegram Message Preview", telegram_message, height=350)
+
+        if selected_chat_id is not None:
+            if st.button("Send Telegram AI Restocking Alert"):
+                sent = send_telegram_alert(selected_chat_id, telegram_message)
+                if sent:
+                    st.success("Telegram AI restocking alert sent successfully.")
+        else:
+            st.info("Register a Telegram user first before sending alert.")
