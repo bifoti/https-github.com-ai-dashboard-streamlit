@@ -8,7 +8,7 @@ import telebot
 # TELEGRAM CONFIG
 # =========================
 # Replace this with your token from @BotFather.
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "8876275131:AAFqLliTehn630SesjjHaV9J4f4K18EGkC0"
 
 USERS_FILE = "users.json"
 LATEST_RESTOCK_FILE = "latest_restocking_alert.json"
