@@ -4,6 +4,10 @@ import joblib
 import matplotlib.pyplot as plt
 import json
 import os
+import calendar
+import hashlib
+import html
+import math
 from datetime import datetime, timedelta
 import telebot
 from sklearn.ensemble import RandomForestRegressor
@@ -17,6 +21,17 @@ latest_values = joblib.load("latest_values.pkl")
 df = pd.read_csv("AyamSerayu_3Years_Transaction_Data.csv")
 df["Tanggal & Waktu"] = pd.to_datetime(df["Tanggal & Waktu"])
 
+QTY_COLUMN = (
+    "Jumlah Produk"
+    if "Jumlah Produk" in df.columns
+    else "Jumlah"
+    if "Jumlah" in df.columns
+    else None
+)
+
+DATA_MIN_DATE = df["Tanggal & Waktu"].min().normalize()
+DATA_MAX_DATE = df["Tanggal & Waktu"].max().normalize()
+
 
 # =========================
 # TELEGRAM CONFIG
@@ -26,6 +41,7 @@ df["Tanggal & Waktu"] = pd.to_datetime(df["Tanggal & Waktu"])
 BOT_TOKEN = "8876275131:AAFqLliTehn630SesjjHaV9J4f4K18EGkC0"
 USERS_FILE = "users.json"
 LATEST_RESTOCK_FILE = "latest_restocking_alert.json"
+AUTO_ALERT_STATE_FILE = "auto_alert_state.json"
 
 try:
     telegram_bot = telebot.TeleBot(BOT_TOKEN)
@@ -66,12 +82,28 @@ def save_latest_restock_alert(data):
     with open(LATEST_RESTOCK_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, default=str)
 
+
+def load_auto_alert_state():
+    ensure_json_file(AUTO_ALERT_STATE_FILE, {})
+    try:
+        with open(AUTO_ALERT_STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except json.JSONDecodeError:
+        state = {}
+
+    return state if isinstance(state, dict) else {}
+
+
+def save_auto_alert_state(state):
+    with open(AUTO_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=4, default=str)
+
 # =========================
 # PAGE CONFIG
 # =========================
 st.set_page_config(
     page_title="AI Restaurant Analytics",
-    page_icon="🤖",
+    page_icon=":fork_and_knife:",
     layout="wide"
 )
 
@@ -102,77 +134,266 @@ def format_idr(value):
 def rm(value):
     return format_currency(value)
 
+
+def safe_html(value):
+    return html.escape(str(value))
+
+
+def compact_number(value):
+    value = float(value)
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K"
+    return f"{value:,.0f}"
+
+
+def compact_currency(value_idr):
+    if st.session_state.get("currency_mode", "MYR") == "MYR":
+        value_myr = convert_idr_to_myr(value_idr)
+        if value_myr >= 1_000_000:
+            return f"RM {value_myr / 1_000_000:.1f}M"
+        if value_myr >= 1_000:
+            return f"RM {value_myr / 1_000:.1f}K"
+        return f"RM {value_myr:,.0f}"
+    return f"Rp {value_idr / 1_000_000:,.1f}M"
+
+
+def render_kpi_card(title, value, note="", accent="fire"):
+    st.markdown(
+        f"""
+        <div class="kpi-card accent-{accent}">
+            <div class="kpi-title">{safe_html(title)}</div>
+            <div class="kpi-value">{safe_html(value)}</div>
+            <div class="kpi-note">{safe_html(note)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+def style_axis(ax):
+    ax.set_facecolor("#111820")
+    ax.figure.set_facecolor("#0b0f14")
+    ax.tick_params(colors="#c8d0d9")
+    ax.title.set_color("#f7f2ea")
+    ax.xaxis.label.set_color("#c8d0d9")
+    ax.yaxis.label.set_color("#c8d0d9")
+    for spine in ax.spines.values():
+        spine.set_color("#2b333d")
+    ax.grid(True, color="#2b333d", linewidth=0.6, alpha=0.45)
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.get_frame().set_facecolor("#111820")
+        legend.get_frame().set_edgecolor("#2b333d")
+        for text in legend.get_texts():
+            text.set_color("#f7f2ea")
+
 # =========================
 # CUSTOM CSS
 # =========================
 st.markdown("""
 <style>
 html, body, [class*="css"] {
-    background-color: #070b14;
-    color: white;
-    font-family: 'Segoe UI';
+    background-color: #0b0f14;
+    color: #f7f2ea;
+    font-family: 'Segoe UI', sans-serif;
 }
-.main-title {
-    font-size: 50px;
-    font-weight: 900;
-    background: linear-gradient(90deg,#00F5FF,#7B61FF);
-    -webkit-background-clip: text;
-    -webkit-text-fill-color: transparent;
+[data-testid="stAppViewContainer"] {
+    background:
+        linear-gradient(180deg, rgba(12,17,22,0.96), rgba(9,12,16,1)),
+        repeating-linear-gradient(90deg, rgba(255,255,255,0.025) 0 1px, transparent 1px 64px);
 }
-.subtitle {
-    color: #8b98b5;
-    font-size: 18px;
+section[data-testid="stSidebar"] {
+    background: #10161d;
+    border-right: 1px solid rgba(255,255,255,0.08);
+}
+.ops-hero {
+    background:
+        linear-gradient(135deg, rgba(255,90,61,0.18), rgba(47,214,163,0.08) 48%, rgba(242,184,75,0.12)),
+        #111820;
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 8px;
+    padding: 24px;
+    box-shadow: 0 18px 42px rgba(0,0,0,0.28);
     margin-bottom: 20px;
 }
+.ops-kicker {
+    color: #2fd6a3;
+    font-size: 13px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0;
+    margin-bottom: 8px;
+}
+.main-title {
+    font-size: 46px;
+    font-weight: 900;
+    color: #fff7ef;
+    line-height: 1.05;
+}
+.subtitle {
+    color: #c8d0d9;
+    font-size: 17px;
+    margin-top: 10px;
+    margin-bottom: 18px;
+    max-width: 900px;
+}
+.service-strip {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 10px;
+}
+.service-chip {
+    background: rgba(255,255,255,0.07);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 8px;
+    padding: 12px 14px;
+}
+.service-chip span {
+    display: block;
+    color: #9aa7b5;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0;
+}
+.service-chip strong {
+    display: block;
+    color: #f7f2ea;
+    font-size: 17px;
+    margin-top: 4px;
+}
 .kpi-card, .forecast-card {
-    background: linear-gradient(145deg, rgba(0,245,255,0.10), rgba(123,97,255,0.08));
-    border: 1px solid rgba(0,245,255,0.25);
-    border-radius: 20px;
-    padding: 25px;
-    box-shadow: 0 0 25px rgba(0,245,255,0.10);
+    background: rgba(17,24,32,0.96);
+    border: 1px solid rgba(255,255,255,0.10);
+    border-top: 4px solid #ff5a3d;
+    border-radius: 8px;
+    padding: 20px;
+    box-shadow: 0 14px 32px rgba(0,0,0,0.22);
+    min-height: 120px;
 }
 .kpi-title {
-    color: #94a3b8;
+    color: #aab5c1;
     font-size: 14px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0;
 }
 .kpi-value {
-    color: #00F5FF;
-    font-size: 36px;
+    color: #fff7ef;
+    font-size: 34px;
     font-weight: 900;
+    margin-top: 8px;
+    overflow-wrap: anywhere;
+}
+.kpi-note {
+    color: #8f9ba8;
+    font-size: 13px;
+    margin-top: 8px;
+}
+.accent-fire {
+    border-top-color: #ff5a3d;
+}
+.accent-mint {
+    border-top-color: #2fd6a3;
+}
+.accent-amber {
+    border-top-color: #f2b84b;
+}
+.accent-steel {
+    border-top-color: #7aa7ff;
 }
 .forecast-title {
-    font-size: 28px;
+    font-size: 24px;
     font-weight: 800;
-    color: white;
+    color: #fff7ef;
 }
 .forecast-desc {
-    color: #94a3b8;
+    color: #aab5c1;
     font-size: 14px;
 }
 .forecast-value {
-    color: #00F5FF;
-    font-size: 42px;
+    color: #2fd6a3;
+    font-size: 36px;
     font-weight: 900;
 }
 .badge {
     display: inline-block;
-    background: rgba(0,245,255,0.15);
-    color: #00F5FF;
-    padding: 6px 12px;
-    border-radius: 999px;
+    background: rgba(255,90,61,0.16);
+    color: #ffb19f;
+    padding: 6px 10px;
+    border-radius: 8px;
     font-size: 12px;
     font-weight: 700;
     margin-bottom: 15px;
+    text-transform: uppercase;
+    letter-spacing: 0;
+}
+.section-label {
+    color: #f2b84b;
+    font-size: 15px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0;
+    margin: 8px 0 12px 0;
+}
+.menu-board {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 10px;
+    margin-bottom: 12px;
+}
+.menu-tile {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.09);
+    border-radius: 8px;
+    padding: 12px;
+}
+.menu-tile span {
+    display: block;
+    color: #9aa7b5;
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+.menu-tile strong {
+    display: block;
+    color: #f7f2ea;
+    font-size: 18px;
+    margin-top: 5px;
 }
 .stButton>button {
     width: 100%;
-    background: linear-gradient(90deg,#00F5FF,#7B61FF);
-    color: white;
+    background: linear-gradient(90deg,#ff5a3d,#f2b84b);
+    color: #16130f;
     border: none;
-    border-radius: 12px;
+    border-radius: 8px;
     height: 50px;
     font-weight: bold;
     font-size: 16px;
+}
+.stButton>button:hover {
+    border: none;
+    color: #16130f;
+    filter: brightness(1.04);
+}
+[data-testid="stMetric"] {
+    background: rgba(17,24,32,0.86);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px;
+    padding: 14px;
+}
+@media (max-width: 700px) {
+    .main-title {
+        font-size: 34px;
+    }
+    .service-strip, .menu-board {
+        grid-template-columns: 1fr;
+    }
+    .kpi-value, .forecast-value {
+        font-size: 28px;
+    }
 }
 </style>
 """, unsafe_allow_html=True)
@@ -180,29 +401,133 @@ html, body, [class*="css"] {
 # =========================
 # FUNCTIONS
 # =========================
-def create_input(date):
-    date = pd.to_datetime(date)
+@st.cache_data(show_spinner=False)
+def get_daily_sales_history(data_rows, min_date, max_date):
+    daily_sales = (
+        df.groupby(df["Tanggal & Waktu"].dt.normalize())["Total"]
+        .sum()
+        .sort_index()
+        .asfreq("D")
+        .fillna(0)
+    )
+    return daily_sales
+
+
+@st.cache_data(show_spinner=False)
+def get_outlet_share(data_rows, min_date, max_date):
+    share = df.groupby("Outlet")["Total"].sum() / df["Total"].sum()
+    return share.to_dict()
+
+
+def series_value(series, date, fallback):
+    date = pd.to_datetime(date).normalize()
+    if date in series.index and pd.notna(series.loc[date]):
+        return float(series.loc[date])
+    return float(fallback)
+
+
+def create_input(date, sales_history=None):
+    date = pd.to_datetime(date).normalize()
+
+    if sales_history is None:
+        sales_history = get_daily_sales_history(
+            len(df),
+            str(DATA_MIN_DATE.date()),
+            str(DATA_MAX_DATE.date())
+        )
+
+    trailing_sales = sales_history[sales_history.index < date].tail(7)
+    rolling_mean_7 = (
+        float(trailing_sales.mean())
+        if len(trailing_sales) > 0
+        else float(latest_values["rolling_mean_7"])
+    )
+    rolling_std_7 = (
+        float(trailing_sales.std())
+        if len(trailing_sales) > 1
+        else float(latest_values["rolling_std_7"])
+    )
+
     return pd.DataFrame({
         "month": [date.month],
         "day": [date.day],
         "dayofweek": [date.dayofweek],
         "weekofyear": [date.isocalendar().week],
         "quarter": [date.quarter],
-        "lag_1": [latest_values["last_lag_1"]],
-        "lag_7": [latest_values["last_lag_7"]],
-        "rolling_mean_7": [latest_values["rolling_mean_7"]],
-        "rolling_std_7": [latest_values["rolling_std_7"]]
+        "lag_1": [
+            series_value(
+                sales_history,
+                date - pd.Timedelta(days=1),
+                latest_values["last_lag_1"]
+            )
+        ],
+        "lag_7": [
+            series_value(
+                sales_history,
+                date - pd.Timedelta(days=7),
+                latest_values["last_lag_7"]
+            )
+        ],
+        "rolling_mean_7": [rolling_mean_7],
+        "rolling_std_7": [rolling_std_7]
     })
 
 
 def predict_total_sales(date):
-    input_data = create_input(date)
-    return model.predict(input_data)[0]
+    return predict_total_sales_for_dates([date])[0]
+
+
+def predict_total_sales_for_dates(dates):
+    normalized_dates = [pd.to_datetime(date).normalize() for date in dates]
+    if len(normalized_dates) == 0:
+        return []
+
+    sales_history = get_daily_sales_history(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    ).copy()
+
+    predictions = {}
+    last_known_date = sales_history.index.max()
+
+    for target_date in sorted(set(normalized_dates)):
+        if target_date <= last_known_date:
+            input_data = create_input(target_date, sales_history)
+            predictions[target_date] = max(float(model.predict(input_data)[0]), 0)
+            continue
+
+        current_date = last_known_date + pd.Timedelta(days=1)
+        while current_date <= target_date:
+            input_data = create_input(current_date, sales_history)
+            prediction = max(float(model.predict(input_data)[0]), 0)
+            sales_history.loc[current_date] = prediction
+            predictions[current_date] = prediction
+            last_known_date = current_date
+            current_date = current_date + pd.Timedelta(days=1)
+
+    return [predictions[date] for date in normalized_dates]
 
 
 def get_outlet_prediction(total_prediction, outlet):
-    outlet_share = df.groupby("Outlet")["Total"].sum() / df["Total"].sum()
-    return total_prediction * outlet_share[outlet]
+    outlet_share = get_outlet_share(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    )
+    return total_prediction * outlet_share.get(outlet, 0)
+
+
+def forecast_horizon_note(date):
+    forecast_date = pd.to_datetime(date).normalize()
+    horizon_days = (forecast_date - DATA_MAX_DATE).days
+    if horizon_days <= 0:
+        return "Historical range"
+    if horizon_days <= 30:
+        return f"{horizon_days} days beyond data - near-term"
+    if horizon_days <= 120:
+        return f"{horizon_days} days beyond data - medium horizon"
+    return f"{horizon_days} days beyond data - scenario forecast"
 
 
 def get_product_combo(product_name, top_n=5):
@@ -220,6 +545,14 @@ def get_product_combo(product_name, top_n=5):
         .reset_index()
     )
 
+    if combo_result.empty:
+        combo_result = (
+            df[df["Nama Produk"] != product_name]["Nama Produk"]
+            .value_counts()
+            .head(top_n)
+            .reset_index()
+        )
+
     combo_result.columns = ["Recommended Combo Item", "Frequency"]
     return combo_result
 
@@ -235,7 +568,7 @@ def product_sales_summary(product_name):
     product_df = df[df["Nama Produk"] == product_name]
     total_sales_idr = product_df["Total"].sum()
     total_sales_myr = convert_idr_to_myr(total_sales_idr)
-    total_qty = product_df["Jumlah"].sum() if "Jumlah" in product_df.columns else len(product_df)
+    total_qty = product_df[QTY_COLUMN].sum() if QTY_COLUMN is not None else len(product_df)
     total_transactions = product_df["ID Struk"].nunique()
     avg_basket_idr = total_sales_idr / total_transactions if total_transactions > 0 else 0
     avg_basket_myr = convert_idr_to_myr(avg_basket_idr)
@@ -319,12 +652,15 @@ def create_monthly_ingredient_usage(data, recipe_map):
     working_df["year"] = working_df["Tanggal & Waktu"].dt.year
     working_df["month"] = working_df["Tanggal & Waktu"].dt.month
 
-    if "Jumlah" not in working_df.columns:
-        working_df["Jumlah"] = 1
+    working_df["_ForecastQty"] = (
+        working_df[QTY_COLUMN].fillna(0)
+        if QTY_COLUMN is not None
+        else 1
+    )
 
     for ingredient in INGREDIENT_COLUMNS:
         working_df[ingredient] = working_df.apply(
-            lambda row: recipe_map.get(row["Nama Produk"], {}).get(ingredient, 0) * row["Jumlah"],
+            lambda row: recipe_map.get(row["Nama Produk"], {}).get(ingredient, 0) * row["_ForecastQty"],
             axis=1
         )
 
@@ -346,10 +682,10 @@ def add_monthly_ai_features(monthly_usage):
         monthly_df[f"rolling_mean_3_{ingredient}"] = monthly_df[ingredient].rolling(3).mean()
 
     monthly_df["month_sin"] = monthly_df["month"].apply(
-        lambda x: __import__("math").sin(2 * __import__("math").pi * x / 12)
+        lambda x: math.sin(2 * math.pi * x / 12)
     )
     monthly_df["month_cos"] = monthly_df["month"].apply(
-        lambda x: __import__("math").cos(2 * __import__("math").pi * x / 12)
+        lambda x: math.cos(2 * math.pi * x / 12)
     )
 
     monthly_df = monthly_df.dropna()
@@ -409,9 +745,8 @@ def detect_seasonal_event(simulated_today, forecast_month):
     return event_name, multiplier, confidence
 
 
-def predict_monthly_ingredient_demand(inventory_model, latest_month, feature_cols, forecast_year, forecast_month, seasonal_multiplier):
-    import math
-
+def predict_monthly_ingredient_demand(inventory_model, monthly_usage, latest_month, feature_cols, forecast_year, forecast_month, seasonal_multiplier):
+    recent_months = monthly_usage.tail(3)
     input_data = {
         "year": [forecast_year],
         "month": [forecast_month],
@@ -421,8 +756,9 @@ def predict_monthly_ingredient_demand(inventory_model, latest_month, feature_col
 
     for ingredient in INGREDIENT_COLUMNS:
         latest_value = latest_month[ingredient]
+        rolling_value = recent_months[ingredient].mean()
         input_data[f"lag_1_{ingredient}"] = [latest_value]
-        input_data[f"rolling_mean_3_{ingredient}"] = [latest_value]
+        input_data[f"rolling_mean_3_{ingredient}"] = [rolling_value]
 
     X_future = pd.DataFrame(input_data)[feature_cols]
     prediction = inventory_model.predict(X_future)[0]
@@ -433,25 +769,89 @@ def predict_monthly_ingredient_demand(inventory_model, latest_month, feature_col
 
     return result
 
+
+PRIORITY_RANK = {
+    "SUFFICIENT": 0,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3
+}
+
+
+AUTO_ALERT_THRESHOLDS = {
+    "HIGH only": 3,
+    "MEDIUM and HIGH": 2,
+    "Any shortage": 1
+}
+
+
+def get_auto_alert_items(result_df, threshold_label):
+    minimum_rank = AUTO_ALERT_THRESHOLDS[threshold_label]
+    working_df = result_df.copy()
+    working_df["_priority_rank"] = working_df["Priority"].map(PRIORITY_RANK).fillna(0)
+    alert_items = working_df[
+        (working_df["_priority_rank"] >= minimum_rank) &
+        (working_df["Recommended Restock Quantity"] > 0)
+    ].copy()
+    return alert_items.sort_values(
+        ["_priority_rank", "Recommended Restock Quantity"],
+        ascending=[False, False]
+    ).drop(columns=["_priority_rank"])
+
+
+def build_auto_alert_key(company, simulated_today, forecast_year, forecast_month, threshold_label, alert_items):
+    payload = {
+        "company": company,
+        "simulated_today": str(pd.to_datetime(simulated_today).date()),
+        "forecast_year": int(forecast_year),
+        "forecast_month": int(forecast_month),
+        "threshold": threshold_label,
+        "items": alert_items[
+            ["Ingredient", "Recommended Restock Quantity", "Priority"]
+        ].to_dict("records")
+    }
+    raw_key = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:20]
+
 # =========================
 # HEADER
 # =========================
-st.markdown(
-    '<div class="main-title">AI Restaurant Analytics Dashboard</div>',
-    unsafe_allow_html=True
-)
+data_window = f"{DATA_MIN_DATE.strftime('%d %b %Y')} - {DATA_MAX_DATE.strftime('%d %b %Y')}"
+total_orders = df["ID Struk"].nunique()
+total_items = df[QTY_COLUMN].sum() if QTY_COLUMN is not None else len(df)
 
 st.markdown(
-    '<div class="subtitle">Forecasting + Market Basket Analysis + Combo Control</div>',
+    f"""
+    <div class="ops-hero">
+        <div class="ops-kicker">Ayam Serayu restaurant demand cockpit</div>
+        <div class="main-title">Kitchen Demand Forecasting</div>
+        <div class="subtitle">
+            Sales forecast, combo planning, and ingredient restocking in one operations view.
+        </div>
+        <div class="service-strip">
+            <div class="service-chip"><span>Data Window</span><strong>{safe_html(data_window)}</strong></div>
+            <div class="service-chip"><span>Outlets</span><strong>{df["Outlet"].nunique()}</strong></div>
+            <div class="service-chip"><span>Menu Items</span><strong>{df["Nama Produk"].nunique()}</strong></div>
+            <div class="service-chip"><span>Items Sold</span><strong>{safe_html(compact_number(total_items))}</strong></div>
+        </div>
+    </div>
+    """,
     unsafe_allow_html=True
 )
 
 # =========================
 # SIDEBAR NAVIGATION
 # =========================
+page_labels = {
+    "Dashboard": "Demand Kitchen",
+    "Combo Control": "Combo Counter",
+    "AI Restocking Demo": "Stock Planner"
+}
+
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Combo Control", "AI Restocking Demo"]
+    ["Dashboard", "Combo Control", "AI Restocking Demo"],
+    format_func=lambda value: page_labels[value]
 )
 
 st.sidebar.divider()
@@ -476,34 +876,55 @@ else:
 # =========================
 if page == "Dashboard":
 
-    k1, k2, k3 = st.columns(3)
+    daily_history = get_daily_sales_history(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    )
+    top_outlet = df.groupby("Outlet")["Total"].sum().idxmax()
+    top_product = (
+        df.groupby("Nama Produk")[QTY_COLUMN].sum().idxmax()
+        if QTY_COLUMN is not None
+        else df["Nama Produk"].value_counts().idxmax()
+    )
+    avg_daily_sales = daily_history.mean()
+
+    k1, k2, k3, k4 = st.columns(4)
 
     with k1:
-        st.markdown("""
-        <div class="kpi-card">
-            <div class="kpi-title">Total Transactions</div>
-            <div class="kpi-value">626K+</div>
-        </div>
-        """, unsafe_allow_html=True)
+        render_kpi_card(
+            "Orders Served",
+            compact_number(total_orders),
+            "Unique receipts in dataset",
+            "fire"
+        )
 
     with k2:
-        st.markdown("""
-        <div class="kpi-card">
-            <div class="kpi-title">Model Accuracy</div>
-            <div class="kpi-value">86.4%</div>
-        </div>
-        """, unsafe_allow_html=True)
+        render_kpi_card(
+            "Avg Daily Demand",
+            compact_currency(avg_daily_sales),
+            "Across all outlets",
+            "mint"
+        )
 
     with k3:
-        st.markdown("""
-        <div class="kpi-card">
-            <div class="kpi-title">AI Engine</div>
-            <div class="kpi-value">MBA + ML</div>
-        </div>
-        """, unsafe_allow_html=True)
+        render_kpi_card(
+            "Busiest Outlet",
+            top_outlet.replace("AYAM SERAYU - ", ""),
+            "Highest historical sales",
+            "amber"
+        )
+
+    with k4:
+        render_kpi_card(
+            "Top Menu Pull",
+            top_product,
+            "By item quantity sold",
+            "steel"
+        )
 
     st.divider()
-    st.subheader("Prediction Control Panel")
+    st.markdown('<div class="section-label">Service Forecast Control</div>', unsafe_allow_html=True)
 
     outlets = sorted(df["Outlet"].dropna().unique())
     selected_outlet = st.selectbox("Select Outlet", outlets)
@@ -515,7 +936,7 @@ if page == "Dashboard":
     )
 
     st.divider()
-    st.subheader("Promotion & Combo Simulator")
+    st.markdown('<div class="section-label">Promo Counter</div>', unsafe_allow_html=True)
 
     c1, c2, c3 = st.columns(3)
 
@@ -542,29 +963,76 @@ if page == "Dashboard":
 
     combo_items = get_product_combo(selected_product, top_combo_n)
 
-    st.markdown("""
-    <div class="forecast-card">
-        <div class="badge">MARKET BASKET ANALYSIS</div>
-        <h3>Recommended Combo Products</h3>
-        <p class="forecast-desc">AI detected products frequently purchased together.</p>
+    st.markdown(f"""
+    <div class="forecast-card accent-amber">
+        <div class="badge">Market Basket</div>
+        <div class="forecast-title">Combo pairing for {safe_html(selected_product)}</div>
+        <p class="forecast-desc">Frequently bought together from historical receipts.</p>
     </div>
     """, unsafe_allow_html=True)
 
-    st.dataframe(combo_items, use_container_width=True)
+    st.dataframe(combo_items, width="stretch")
 
     selected_combo = st.selectbox(
         "Choose Combo Item",
         combo_items["Recommended Combo Item"].tolist()
     )
 
+    preview_start = max(pd.Timestamp(datetime.today()).normalize(), DATA_MAX_DATE + pd.Timedelta(days=1))
+    preview_dates = pd.date_range(preview_start, periods=14, freq="D")
+    preview_total_sales = predict_total_sales_for_dates(preview_dates)
+    preview_outlet_sales = [
+        get_outlet_prediction(value, selected_outlet)
+        for value in preview_total_sales
+    ]
+    preview_df = pd.DataFrame({
+        "Date": preview_dates,
+        "Forecast": preview_outlet_sales
+    })
+    peak_row = preview_df.loc[preview_df["Forecast"].idxmax()]
+    calm_row = preview_df.loc[preview_df["Forecast"].idxmin()]
+    preview_total_label = compact_currency(preview_df["Forecast"].sum())
+    peak_day_label = peak_row["Date"].strftime("%d %b")
+    calm_day_label = calm_row["Date"].strftime("%d %b")
+
+    st.markdown(f"""
+    <div class="menu-board">
+        <div class="menu-tile"><span>Next 14 Days</span><strong>{safe_html(preview_total_label)}</strong></div>
+        <div class="menu-tile"><span>Peak Prep Day</span><strong>{safe_html(peak_day_label)}</strong></div>
+        <div class="menu-tile"><span>Lightest Day</span><strong>{safe_html(calm_day_label)}</strong></div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    fig, ax = plt.subplots(figsize=(11, 3.6))
+    ax.plot(
+        preview_df["Date"],
+        preview_df["Forecast"].apply(convert_idr_to_myr),
+        color="#ff5a3d",
+        marker="o",
+        linewidth=2.4,
+        label="Outlet forecast"
+    )
+    ax.fill_between(
+        preview_df["Date"],
+        preview_df["Forecast"].apply(convert_idr_to_myr),
+        color="#ff5a3d",
+        alpha=0.14
+    )
+    ax.set_title(f"14-Day Service Demand Preview - {selected_outlet}")
+    ax.set_xlabel("Service Date")
+    ax.set_ylabel("Forecast (MYR)")
+    style_axis(ax)
+    plt.xticks(rotation=25)
+    st.pyplot(fig)
+
     st.divider()
-    st.header("Forecast Modules")
+    st.markdown('<div class="section-label">Kitchen Forecast Modules</div>', unsafe_allow_html=True)
 
     daily_col, monthly_col = st.columns(2)
 
     with daily_col:
         st.markdown("""
-        <div class="forecast-card">
+        <div class="forecast-card accent-mint">
             <div class="badge">DAILY AI</div>
             <div class="forecast-title">Daily Outlet Forecast</div>
             <p class="forecast-desc">Predict daily sales with combo promotion simulation.</p>
@@ -577,6 +1045,7 @@ if page == "Dashboard":
             if st.button("Predict Daily"):
                 total_prediction = predict_total_sales(daily_date)
                 outlet_prediction = get_outlet_prediction(total_prediction, selected_outlet)
+                horizon_note = forecast_horizon_note(daily_date)
 
                 discounted_sales, final_sales = apply_discount_simulation(
                     outlet_prediction,
@@ -587,9 +1056,9 @@ if page == "Dashboard":
                 impact = final_sales - outlet_prediction
 
                 st.markdown(f"""
-                <div class="forecast-card">
+                <div class="forecast-card accent-mint">
                     <div class="badge">RESULT</div>
-                    <div class="forecast-title">{selected_outlet}</div>
+                    <div class="forecast-title">{safe_html(selected_outlet)}</div>
                     <hr>
                     <p class="forecast-desc">Base Forecast</p>
                     <div class="forecast-value">{rm(outlet_prediction)}</div>
@@ -597,8 +1066,9 @@ if page == "Dashboard":
                     <p class="forecast-desc">Forecast After Promotion</p>
                     <div class="forecast-value">{rm(final_sales)}</div>
                     <hr>
-                    <p class="forecast-desc">Promo Product: <b>{selected_product}</b></p>
-                    <p class="forecast-desc">Combo Product: <b>{selected_combo}</b></p>
+                    <p class="forecast-desc">Forecast Horizon: <b>{safe_html(horizon_note)}</b></p>
+                    <p class="forecast-desc">Promo Product: <b>{safe_html(selected_product)}</b></p>
+                    <p class="forecast-desc">Combo Product: <b>{safe_html(selected_combo)}</b></p>
                     <p class="forecast-desc">Discount: <b>{discount_rate}%</b></p>
                     <p class="forecast-desc">Uplift Multiplier: <b>{uplift_multiplier}</b></p>
                 </div>
@@ -611,7 +1081,7 @@ if page == "Dashboard":
 
     with monthly_col:
         st.markdown("""
-        <div class="forecast-card">
+        <div class="forecast-card accent-fire">
             <div class="badge">MONTHLY AI</div>
             <div class="forecast-title">Monthly Outlet Forecast</div>
             <p class="forecast-desc">Predict monthly revenue with promotion strategy.</p>
@@ -628,18 +1098,18 @@ if page == "Dashboard":
                 selected_year = st.number_input("Year", 2025, 2030, 2026)
 
             if st.button("Predict Monthly"):
+                days_in_month = calendar.monthrange(int(selected_year), int(selected_month))[1]
                 dates = pd.date_range(
                     start=f"{selected_year}-{selected_month}-01",
-                    periods=31,
+                    periods=days_in_month,
                     freq="D"
                 )
-                dates = dates[dates.month == selected_month]
+                total_predictions = predict_total_sales_for_dates(dates)
 
                 base_predictions = []
                 final_predictions = []
 
-                for d in dates:
-                    total_prediction = predict_total_sales(d)
+                for total_prediction in total_predictions:
                     outlet_prediction = get_outlet_prediction(total_prediction, selected_outlet)
 
                     discounted_sales, final_sales = apply_discount_simulation(
@@ -663,11 +1133,12 @@ if page == "Dashboard":
                 total_base = monthly_df["Base Forecast IDR"].sum()
                 total_final = monthly_df["After Promotion IDR"].sum()
                 impact = total_final - total_base
+                horizon_note = forecast_horizon_note(dates.max())
 
                 st.markdown(f"""
-                <div class="forecast-card">
+                <div class="forecast-card accent-fire">
                     <div class="badge">MONTHLY RESULT</div>
-                    <div class="forecast-title">{selected_outlet}</div>
+                    <div class="forecast-title">{safe_html(selected_outlet)}</div>
                     <hr>
                     <p class="forecast-desc">Monthly Forecast</p>
                     <div class="forecast-value">{rm(total_base)}</div>
@@ -675,8 +1146,9 @@ if page == "Dashboard":
                     <p class="forecast-desc">Forecast After Promotion</p>
                     <div class="forecast-value">{rm(total_final)}</div>
                     <hr>
-                    <p class="forecast-desc">Promo Product: <b>{selected_product}</b></p>
-                    <p class="forecast-desc">Combo Product: <b>{selected_combo}</b></p>
+                    <p class="forecast-desc">Forecast Horizon: <b>{safe_html(horizon_note)}</b></p>
+                    <p class="forecast-desc">Promo Product: <b>{safe_html(selected_product)}</b></p>
+                    <p class="forecast-desc">Combo Product: <b>{safe_html(selected_combo)}</b></p>
                     <p class="forecast-desc">Discount: <b>{discount_rate}%</b></p>
                     <p class="forecast-desc">Uplift Multiplier: <b>{uplift_multiplier}</b></p>
                 </div>
@@ -691,7 +1163,7 @@ if page == "Dashboard":
                 display_df["Base Forecast MYR"] = display_df["Base Forecast MYR"].apply(format_myr)
                 display_df["After Promotion MYR"] = display_df["After Promotion MYR"].apply(format_myr)
 
-                st.dataframe(display_df, use_container_width=True)
+                st.dataframe(display_df, width="stretch")
 
                 fig, ax = plt.subplots(figsize=(10, 4))
                 ax.plot(monthly_df["Date"], monthly_df["Base Forecast MYR"], marker="o", label="Base Forecast")
@@ -700,6 +1172,7 @@ if page == "Dashboard":
                 ax.set_xlabel("Date")
                 ax.set_ylabel("Sales (MYR)")
                 ax.legend()
+                style_axis(ax)
                 plt.xticks(rotation=45)
                 st.pyplot(fig)
 
@@ -708,8 +1181,8 @@ if page == "Dashboard":
 # =========================
 if page == "Combo Control":
 
-    st.header("🛒 Combo Control Page")
-    st.write("Control promo product, combo item, discount, quantity, and expected uplift.")
+    st.header("Combo Counter")
+    st.write("Build restaurant bundles from actual receipt pairing and promo assumptions.")
 
     st.divider()
 
@@ -774,7 +1247,7 @@ if page == "Combo Control":
     st.divider()
 
     st.subheader("AI Combo Recommendation")
-    st.dataframe(ai_combo_df, use_container_width=True)
+    st.dataframe(ai_combo_df, width="stretch")
 
     st.divider()
 
@@ -810,9 +1283,9 @@ if page == "Combo Control":
     st.subheader("Combo Strategy Card")
 
     st.markdown(f"""
-    <div class="forecast-card">
+    <div class="forecast-card accent-amber">
         <div class="badge">COMBO STRATEGY</div>
-        <div class="forecast-title">{main_product} + {combo_product}</div>
+        <div class="forecast-title">{safe_html(main_product)} + {safe_html(combo_product)}</div>
         <br>
         <p class="forecast-desc">Discount: <b>{discount_rate}%</b></p>
         <p class="forecast-desc">Expected Uplift: <b>{expected_uplift}%</b></p>
@@ -847,10 +1320,11 @@ if page == "Combo Control":
     })
 
     fig, ax = plt.subplots(figsize=(9, 5))
-    ax.bar(chart_df["Metric"], chart_df["Revenue MYR"])
+    ax.bar(chart_df["Metric"], chart_df["Revenue MYR"], color=["#7aa7ff", "#f2b84b", "#2fd6a3"])
     ax.set_title("Combo Promotion Revenue Simulation")
     ax.set_xlabel("Metric")
     ax.set_ylabel("Revenue (MYR)")
+    style_axis(ax)
     st.pyplot(fig)
 
     st.divider()
@@ -876,7 +1350,7 @@ if page == "Combo Control":
     detail_df["Total Sales MYR"] = detail_df["Total Sales MYR"].apply(format_myr)
     detail_df["Average Basket MYR"] = detail_df["Average Basket MYR"].apply(format_myr)
 
-    st.dataframe(detail_df, use_container_width=True)
+    st.dataframe(detail_df, width="stretch")
 
 
 # =========================
@@ -884,7 +1358,7 @@ if page == "Combo Control":
 # =========================
 if page == "AI Restocking Demo":
 
-    st.header("📦 AI Monthly Restocking Demo")
+    st.header("Stock Planner")
     st.write(
         "This demo lets users enter current inventory stock and a simulated date. "
         "The system trains an AI monthly ingredient demand model from the transaction dataset, "
@@ -909,6 +1383,32 @@ if page == "AI Restocking Demo":
         )
         selected_chat_id = registered_users[selected_company]["chat_id"]
         st.success(f"Telegram connected for: {selected_company}")
+
+    st.divider()
+
+    st.subheader("Auto Telegram Alert")
+
+    a1, a2 = st.columns(2)
+
+    with a1:
+        auto_alert_enabled = st.checkbox(
+            "Auto send when risk is detected",
+            value=False
+        )
+
+    with a2:
+        auto_alert_threshold = st.selectbox(
+            "Auto Alert Threshold",
+            list(AUTO_ALERT_THRESHOLDS.keys()),
+            index=1
+        )
+
+    with st.expander("Auto alert history"):
+        auto_alert_state = load_auto_alert_state()
+        st.write(f"Sent scenarios stored: {len(auto_alert_state)}")
+        if st.button("Reset Auto Alert History"):
+            save_auto_alert_state({})
+            st.success("Auto alert history reset. The next matching risk scenario can send again.")
 
     st.divider()
 
@@ -987,10 +1487,10 @@ if page == "AI Restocking Demo":
             row = {"Product": product}
             row.update(recipe)
             mapping_rows.append(row)
-        st.dataframe(pd.DataFrame(mapping_rows), use_container_width=True)
+        st.dataframe(pd.DataFrame(mapping_rows), width="stretch")
 
     with st.expander("View Monthly Ingredient Usage Generated From Dataset"):
-        st.dataframe(monthly_usage, use_container_width=True)
+        st.dataframe(monthly_usage, width="stretch")
 
     if inventory_model is None:
         st.error("Not enough monthly data to train inventory forecasting model.")
@@ -1004,6 +1504,7 @@ if page == "AI Restocking Demo":
 
         predicted_demand = predict_monthly_ingredient_demand(
             inventory_model,
+            monthly_usage,
             latest_month,
             feature_cols,
             int(forecast_year),
@@ -1058,7 +1559,7 @@ if page == "AI Restocking Demo":
         with r3:
             st.metric("Suggested Restocking Date", suggested_restock_date.strftime("%d %b %Y"))
 
-        st.dataframe(result_df, use_container_width=True)
+        st.dataframe(result_df, width="stretch")
 
         if len(result_df[result_df["Priority"] == "HIGH"]) > 0:
             st.error("High inventory risk detected. Immediate procurement action is recommended.")
@@ -1071,12 +1572,13 @@ if page == "AI Restocking Demo":
         st.subheader("5. Demand vs Stock Chart")
 
         fig, ax = plt.subplots(figsize=(10, 5))
-        ax.bar(result_df["Ingredient"], result_df["AI Predicted Monthly Demand"], label="AI Predicted Demand")
-        ax.plot(result_df["Ingredient"], result_df["Current Stock"], marker="o", label="Current Stock")
+        ax.bar(result_df["Ingredient"], result_df["AI Predicted Monthly Demand"], color="#ff5a3d", label="AI Predicted Demand")
+        ax.plot(result_df["Ingredient"], result_df["Current Stock"], color="#2fd6a3", marker="o", linewidth=2.4, label="Current Stock")
         ax.set_title("Monthly Ingredient Demand vs Current Stock")
         ax.set_xlabel("Ingredient")
         ax.set_ylabel("Quantity")
         ax.legend()
+        style_axis(ax)
         plt.xticks(rotation=20)
         st.pyplot(fig)
 
@@ -1092,6 +1594,8 @@ if page == "AI Restocking Demo":
             main_suggestion = f"Restock {risky_items.iloc[0]['Ingredient']} first because it has the highest shortage risk."
         else:
             main_suggestion = "No urgent restocking required for this selected timeframe."
+
+        auto_alert_items = get_auto_alert_items(result_df, auto_alert_threshold)
 
         restock_lines = ""
         for _, row in result_df.iterrows():
@@ -1140,10 +1644,56 @@ Main Suggestion:
             "seasonal_confidence": seasonal_confidence,
             "suggested_restock_date": str(suggested_restock_date.date()),
             "recommendations": result_rows,
+            "auto_alert_enabled": auto_alert_enabled,
+            "auto_alert_threshold": auto_alert_threshold,
+            "auto_alert_triggered_items": auto_alert_items.to_dict("records"),
             "main_suggestion": main_suggestion
         }
 
         save_latest_restock_alert(latest_alert)
+
+        if auto_alert_enabled:
+            if selected_chat_id is None:
+                st.warning("Auto alert is enabled, but no Telegram user is registered yet.")
+            elif len(auto_alert_items) == 0:
+                st.success("Auto alert is enabled. No item reached the selected risk threshold.")
+            else:
+                auto_alert_key = build_auto_alert_key(
+                    selected_company,
+                    simulated_today,
+                    forecast_year,
+                    forecast_month,
+                    auto_alert_threshold,
+                    auto_alert_items
+                )
+                auto_alert_state = load_auto_alert_state()
+
+                if auto_alert_key in auto_alert_state:
+                    previous_alert = auto_alert_state[auto_alert_key]
+                    st.info(
+                        "Auto alert already sent for this simulated scenario "
+                        f"at {previous_alert.get('sent_at', 'previous run')}."
+                    )
+                else:
+                    auto_telegram_message = (
+                        telegram_message
+                        + f"\nAuto Trigger Threshold:\n{auto_alert_threshold}\n"
+                    )
+                    sent = send_telegram_alert(selected_chat_id, auto_telegram_message)
+                    if sent:
+                        auto_alert_state[auto_alert_key] = {
+                            "company": selected_company,
+                            "simulated_today": str(pd.to_datetime(simulated_today).date()),
+                            "forecast_month": int(forecast_month),
+                            "forecast_year": int(forecast_year),
+                            "threshold": auto_alert_threshold,
+                            "sent_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "items": auto_alert_items.to_dict("records")
+                        }
+                        save_auto_alert_state(auto_alert_state)
+                        st.success("Auto Telegram alert sent because risk threshold was reached.")
+        else:
+            st.info("Auto alert is off. Manual Telegram sending is still available.")
 
         st.text_area("Telegram Message Preview", telegram_message, height=350)
 

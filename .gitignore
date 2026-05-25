@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+latest_restocking_alert.json
+auto_alert_state.json
