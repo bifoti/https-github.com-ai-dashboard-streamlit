@@ -23,7 +23,7 @@ df["Tanggal & Waktu"] = pd.to_datetime(df["Tanggal & Waktu"])
 # =========================
 # Replace this token with your real token from @BotFather.
 # The bot file will register users and save their chat_id into users.json.
-BOT_TOKEN = "YOUR_BOT_TOKEN"
+BOT_TOKEN = "8876275131:AAFqLliTehn630SesjjHaV9J4f4K18EGkC0"
 USERS_FILE = "users.json"
 LATEST_RESTOCK_FILE = "latest_restocking_alert.json"
 
