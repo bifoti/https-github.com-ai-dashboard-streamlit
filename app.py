@@ -11,6 +11,7 @@ import math
 from datetime import datetime, timedelta
 import telebot
 from sklearn.ensemble import RandomForestRegressor
+from mlxtend.frequent_patterns import apriori, association_rules, fpgrowth
 
 # =========================
 # LOAD DATA
@@ -628,31 +629,187 @@ def model_health_label(mape):
     return "High Risk"
 
 
-def get_product_combo(product_name, top_n=5):
-    receipt_with_product = df[df["Nama Produk"] == product_name]["ID Struk"].unique()
-
-    combo_df = df[
-        (df["ID Struk"].isin(receipt_with_product)) &
-        (df["Nama Produk"] != product_name)
-    ]
-
-    combo_result = (
-        combo_df["Nama Produk"]
-        .value_counts()
-        .head(top_n)
-        .reset_index()
+@st.cache_data(show_spinner=False)
+def build_market_basket_matrix(data_rows, min_date, max_date):
+    basket_source = (
+        df[["ID Struk", "Nama Produk"]]
+        .dropna()
+        .drop_duplicates()
     )
+    basket = pd.crosstab(
+        basket_source["ID Struk"],
+        basket_source["Nama Produk"]
+    ).astype(bool)
+    return basket
 
-    if combo_result.empty:
-        combo_result = (
-            df[df["Nama Produk"] != product_name]["Nama Produk"]
-            .value_counts()
-            .head(top_n)
-            .reset_index()
+
+@st.cache_data(show_spinner=False)
+def mine_association_rules(algorithm, min_support, min_confidence, min_lift, data_rows, min_date, max_date):
+    basket = build_market_basket_matrix(data_rows, min_date, max_date)
+
+    if algorithm == "Apriori":
+        frequent_itemsets = apriori(
+            basket,
+            min_support=float(min_support),
+            use_colnames=True,
+            max_len=2
+        )
+    else:
+        frequent_itemsets = fpgrowth(
+            basket,
+            min_support=float(min_support),
+            use_colnames=True,
+            max_len=2
         )
 
-    combo_result.columns = ["Recommended Combo Item", "Frequency"]
-    return combo_result
+    if frequent_itemsets.empty:
+        return pd.DataFrame()
+
+    rules = association_rules(
+        frequent_itemsets,
+        metric="confidence",
+        min_threshold=float(min_confidence)
+    )
+
+    if rules.empty:
+        return pd.DataFrame()
+
+    rules = rules[rules["lift"] >= float(min_lift)].copy()
+    rules = rules[
+        (rules["antecedents"].apply(len) == 1) &
+        (rules["consequents"].apply(len) == 1)
+    ].copy()
+
+    if rules.empty:
+        return pd.DataFrame()
+
+    rules["Antecedent"] = rules["antecedents"].apply(lambda items: next(iter(items)))
+    rules["Recommended Combo Item"] = rules["consequents"].apply(lambda items: next(iter(items)))
+    rules["Support %"] = rules["support"] * 100
+    rules["Confidence %"] = rules["confidence"] * 100
+    rules["Lift"] = rules["lift"]
+    rules["Rule Strength"] = rules["Lift"] * rules["confidence"]
+    rules["Algorithm"] = algorithm
+
+    return rules[
+        [
+            "Antecedent",
+            "Recommended Combo Item",
+            "Support %",
+            "Confidence %",
+            "Lift",
+            "Rule Strength",
+            "Algorithm"
+        ]
+    ].sort_values(
+        ["Rule Strength", "Lift", "Confidence %"],
+        ascending=False
+    )
+
+
+def get_frequency_combo_fallback(product_name, top_n=5):
+    basket = build_market_basket_matrix(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    )
+
+    if product_name not in basket.columns:
+        return pd.DataFrame(columns=[
+            "Recommended Combo Item",
+            "Frequency",
+            "Support %",
+            "Confidence %",
+            "Lift",
+            "Rule Strength",
+            "Algorithm"
+        ])
+
+    product_mask = basket[product_name]
+    product_count = int(product_mask.sum())
+    total_receipts = len(basket)
+    rows = []
+
+    for item in basket.columns:
+        if item == product_name:
+            continue
+
+        item_mask = basket[item]
+        pair_count = int((product_mask & item_mask).sum())
+        if pair_count == 0:
+            continue
+
+        item_support = float(item_mask.sum() / total_receipts)
+        confidence = float(pair_count / product_count) if product_count > 0 else 0
+        support = float(pair_count / total_receipts)
+        lift = confidence / item_support if item_support > 0 else 0
+
+        rows.append({
+            "Recommended Combo Item": item,
+            "Frequency": pair_count,
+            "Support %": support * 100,
+            "Confidence %": confidence * 100,
+            "Lift": lift,
+            "Rule Strength": lift * confidence,
+            "Algorithm": "Frequency fallback"
+        })
+
+    if len(rows) == 0:
+        return pd.DataFrame(columns=[
+            "Recommended Combo Item",
+            "Frequency",
+            "Support %",
+            "Confidence %",
+            "Lift",
+            "Rule Strength",
+            "Algorithm"
+        ])
+
+    return (
+        pd.DataFrame(rows)
+        .sort_values(["Rule Strength", "Lift", "Frequency"], ascending=False)
+        .head(top_n)
+        .reset_index(drop=True)
+    )
+
+
+def get_product_combo(product_name, top_n=5, algorithm="FP-Growth", min_support=0.01, min_confidence=0.05, min_lift=0.8):
+    rules = mine_association_rules(
+        algorithm,
+        min_support,
+        min_confidence,
+        min_lift,
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    )
+
+    if not rules.empty:
+        product_rules = rules[rules["Antecedent"] == product_name].copy()
+        if not product_rules.empty:
+            product_rules["Frequency"] = (
+                product_rules["Support %"] / 100 * df["ID Struk"].nunique()
+            ).round().astype(int)
+            result = product_rules[
+                [
+                    "Recommended Combo Item",
+                    "Frequency",
+                    "Support %",
+                    "Confidence %",
+                    "Lift",
+                    "Rule Strength",
+                    "Algorithm"
+                ]
+            ].head(top_n).reset_index(drop=True)
+            for metric_col in ["Support %", "Confidence %", "Lift", "Rule Strength"]:
+                result[metric_col] = result[metric_col].round(3)
+            return result
+
+    result = get_frequency_combo_fallback(product_name, top_n)
+    for metric_col in ["Support %", "Confidence %", "Lift", "Rule Strength"]:
+        if metric_col in result.columns:
+            result[metric_col] = result[metric_col].round(3)
+    return result
 
 
 def apply_discount_simulation(base_sales, discount_rate, uplift_multiplier):
@@ -1101,7 +1258,7 @@ if page == "Dashboard":
     st.divider()
     st.markdown('<div class="section-label">Promo Counter</div>', unsafe_allow_html=True)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
 
     with c1:
         discount_rate = st.slider("Discount (%)", 0, 50, 10)
@@ -1110,7 +1267,47 @@ if page == "Dashboard":
         uplift_multiplier = st.slider("Uplift Multiplier", 0.1, 2.0, 0.6, 0.1)
 
     with c3:
+        mba_algorithm = st.selectbox(
+            "MBA Algorithm",
+            ["FP-Growth", "Apriori"],
+            key="dashboard_mba_algorithm"
+        )
+
+    with c4:
         top_combo_n = st.slider("No. of Combo Suggestions", 3, 10, 5)
+
+    with st.expander("Association Rule Settings"):
+        r1, r2, r3 = st.columns(3)
+
+        with r1:
+            min_support_percent = st.slider(
+                "Minimum Support (%)",
+                0.1,
+                10.0,
+                1.0,
+                0.1,
+                key="dashboard_min_support"
+            )
+
+        with r2:
+            min_confidence_percent = st.slider(
+                "Minimum Confidence (%)",
+                1.0,
+                80.0,
+                5.0,
+                1.0,
+                key="dashboard_min_confidence"
+            )
+
+        with r3:
+            min_lift = st.slider(
+                "Minimum Lift",
+                0.5,
+                5.0,
+                0.8,
+                0.1,
+                key="dashboard_min_lift"
+            )
 
     c4, c5 = st.columns(2)
 
@@ -1124,22 +1321,35 @@ if page == "Dashboard":
         )
         selected_product = st.selectbox("Promo Product", products)
 
-    combo_items = get_product_combo(selected_product, top_combo_n)
+    combo_items = get_product_combo(
+        selected_product,
+        top_combo_n,
+        mba_algorithm,
+        min_support_percent / 100,
+        min_confidence_percent / 100,
+        min_lift
+    )
 
     st.markdown(f"""
     <div class="forecast-card accent-amber">
         <div class="badge">Market Basket</div>
         <div class="forecast-title">Combo pairing for {safe_html(selected_product)}</div>
-        <p class="forecast-desc">Frequently bought together from historical receipts.</p>
+        <p class="forecast-desc">{safe_html(mba_algorithm)} association rules ranked by support, confidence, and lift.</p>
     </div>
     """, unsafe_allow_html=True)
 
     st.dataframe(combo_items, width="stretch")
 
-    selected_combo = st.selectbox(
-        "Choose Combo Item",
-        combo_items["Recommended Combo Item"].tolist()
-    )
+    if combo_items.empty:
+        st.warning("No combo rules found. Lower support/confidence/lift thresholds.")
+        selected_combo = "No combo found"
+    else:
+        if combo_items["Lift"].max() < 1:
+            st.info("Lift is below 1 for the current product, so these are the strongest available pairings but not strong positive associations.")
+        selected_combo = st.selectbox(
+            "Choose Combo Item",
+            combo_items["Recommended Combo Item"].tolist()
+        )
 
     preview_start = max(pd.Timestamp(datetime.today()).normalize(), DATA_MAX_DATE + pd.Timedelta(days=1))
     preview_dates = pd.date_range(preview_start, periods=14, freq="D")
@@ -1568,20 +1778,73 @@ if page == "Combo Control":
         )
         main_product = st.selectbox("Main Product", combo_products)
 
-        top_n = st.slider("Number of AI Combo Suggestions", 3, 15, 5)
-        ai_combo_df = get_product_combo(main_product, top_n)
+        cb1, cb2 = st.columns(2)
+
+        with cb1:
+            combo_algorithm = st.selectbox(
+                "MBA Algorithm",
+                ["FP-Growth", "Apriori"],
+                key="combo_mba_algorithm"
+            )
+
+        with cb2:
+            top_n = st.slider("Number of AI Combo Suggestions", 3, 15, 5)
+
+        with st.expander("Association Rule Settings"):
+            ar1, ar2, ar3 = st.columns(3)
+
+            with ar1:
+                combo_min_support_percent = st.slider(
+                    "Minimum Support (%)",
+                    0.1,
+                    10.0,
+                    1.0,
+                    0.1,
+                    key="combo_min_support"
+                )
+
+            with ar2:
+                combo_min_confidence_percent = st.slider(
+                    "Minimum Confidence (%)",
+                    1.0,
+                    80.0,
+                    5.0,
+                    1.0,
+                    key="combo_min_confidence"
+                )
+
+            with ar3:
+                combo_min_lift = st.slider(
+                    "Minimum Lift",
+                    0.5,
+                    5.0,
+                    0.8,
+                    0.1,
+                    key="combo_min_lift"
+                )
+
+        ai_combo_df = get_product_combo(
+            main_product,
+            top_n,
+            combo_algorithm,
+            combo_min_support_percent / 100,
+            combo_min_confidence_percent / 100,
+            combo_min_lift
+        )
 
         combo_mode = st.radio(
             "Combo Selection Mode",
             ["AI Recommended Combo", "Manual Combo"]
         )
 
-        if combo_mode == "AI Recommended Combo":
+        if combo_mode == "AI Recommended Combo" and not ai_combo_df.empty:
             combo_product = st.selectbox(
                 "Choose AI Combo Product",
                 ai_combo_df["Recommended Combo Item"].tolist()
             )
         else:
+            if combo_mode == "AI Recommended Combo":
+                st.warning("No association rules found. Manual combo selection is shown instead.")
             all_products = sorted(df["Nama Produk"].dropna().unique())
             combo_product = st.selectbox("Choose Manual Combo Product", all_products)
 
@@ -1617,6 +1880,8 @@ if page == "Combo Control":
 
     st.subheader("AI Combo Recommendation")
     st.dataframe(ai_combo_df, width="stretch")
+    if not ai_combo_df.empty and ai_combo_df["Lift"].max() < 1:
+        st.info("Lift is below 1 for this product, so the table shows the strongest available pairings rather than strong positive associations.")
 
     st.divider()
 
