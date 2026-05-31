@@ -42,6 +42,7 @@ BOT_TOKEN = "8876275131:AAFqLliTehn630SesjjHaV9J4f4K18EGkC0"
 USERS_FILE = "users.json"
 LATEST_RESTOCK_FILE = "latest_restocking_alert.json"
 AUTO_ALERT_STATE_FILE = "auto_alert_state.json"
+ALERT_CENTER_FILE = "alert_center.json"
 
 try:
     telegram_bot = telebot.TeleBot(BOT_TOKEN)
@@ -97,6 +98,48 @@ def load_auto_alert_state():
 def save_auto_alert_state(state):
     with open(AUTO_ALERT_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, indent=4, default=str)
+
+
+def load_alert_center():
+    ensure_json_file(ALERT_CENTER_FILE, [])
+    try:
+        with open(ALERT_CENTER_FILE, "r", encoding="utf-8") as f:
+            alerts = json.load(f)
+    except json.JSONDecodeError:
+        alerts = []
+
+    return alerts if isinstance(alerts, list) else []
+
+
+def save_alert_center(alerts):
+    with open(ALERT_CENTER_FILE, "w", encoding="utf-8") as f:
+        json.dump(alerts, f, indent=4, default=str)
+
+
+def add_alert_center_event(company, title, status, channel, severity, message, items=None, dedupe_key=None):
+    alerts = load_alert_center()
+    if dedupe_key is not None:
+        for alert in alerts:
+            if alert.get("dedupe_key") == dedupe_key and alert.get("status") == status:
+                return alert.get("id")
+
+    alert_id = hashlib.sha256(
+        f"{company}|{title}|{status}|{channel}|{datetime.now().isoformat()}".encode("utf-8")
+    ).hexdigest()[:12]
+    alerts.insert(0, {
+        "id": alert_id,
+        "dedupe_key": dedupe_key,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "company": company,
+        "title": title,
+        "status": status,
+        "channel": channel,
+        "severity": severity,
+        "message": message,
+        "items": items or []
+    })
+    save_alert_center(alerts[:100])
+    return alert_id
 
 # =========================
 # PAGE CONFIG
@@ -530,6 +573,61 @@ def forecast_horizon_note(date):
     return f"{horizon_days} days beyond data - scenario forecast"
 
 
+@st.cache_data(show_spinner=False)
+def build_historical_model_frame(data_rows, min_date, max_date):
+    daily_sales = get_daily_sales_history(data_rows, min_date, max_date)
+    model_df = pd.DataFrame({
+        "sales": daily_sales
+    })
+    model_df["month"] = model_df.index.month
+    model_df["day"] = model_df.index.day
+    model_df["dayofweek"] = model_df.index.dayofweek
+    model_df["weekofyear"] = model_df.index.isocalendar().week.astype(int)
+    model_df["quarter"] = model_df.index.quarter
+    model_df["lag_1"] = model_df["sales"].shift(1)
+    model_df["lag_7"] = model_df["sales"].shift(7)
+    model_df["rolling_mean_7"] = model_df["sales"].shift(1).rolling(7).mean()
+    model_df["rolling_std_7"] = model_df["sales"].shift(1).rolling(7).std()
+    return model_df.dropna()
+
+
+def evaluate_sales_model(evaluation_days):
+    feature_cols = list(getattr(model, "feature_names_in_", []))
+    model_df = build_historical_model_frame(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    )
+    eval_df = model_df.tail(int(evaluation_days)).copy()
+    eval_df["Predicted Sales IDR"] = model.predict(eval_df[feature_cols])
+    eval_df["Actual Sales IDR"] = eval_df["sales"]
+    eval_df["Error IDR"] = eval_df["Actual Sales IDR"] - eval_df["Predicted Sales IDR"]
+    eval_df["Abs Error IDR"] = eval_df["Error IDR"].abs()
+    eval_df["APE"] = eval_df["Abs Error IDR"] / eval_df["Actual Sales IDR"].replace(0, pd.NA)
+
+    actual = eval_df["Actual Sales IDR"]
+    predicted = eval_df["Predicted Sales IDR"]
+    mae = float(eval_df["Abs Error IDR"].mean())
+    mape = float(eval_df["APE"].dropna().mean() * 100)
+    ss_res = float(((actual - predicted) ** 2).sum())
+    ss_tot = float(((actual - actual.mean()) ** 2).sum())
+    r2 = 1 - (ss_res / ss_tot) if ss_tot != 0 else 0
+
+    eval_df = eval_df.reset_index()
+    eval_df = eval_df.rename(columns={eval_df.columns[0]: "Date"})
+    return eval_df, mae, mape, r2
+
+
+def model_health_label(mape):
+    if mape <= 10:
+        return "Strong"
+    if mape <= 18:
+        return "Good"
+    if mape <= 28:
+        return "Needs Attention"
+    return "High Risk"
+
+
 def get_product_combo(product_name, top_n=5):
     receipt_with_product = df[df["Nama Produk"] == product_name]["ID Struk"].unique()
 
@@ -580,6 +678,45 @@ def product_sales_summary(product_name):
         "total_transactions": total_transactions,
         "avg_basket_myr": avg_basket_myr
     }
+
+
+def top_product_by_quantity():
+    if QTY_COLUMN is not None:
+        return df.groupby("Nama Produk")[QTY_COLUMN].sum().idxmax()
+    return df["Nama Produk"].value_counts().idxmax()
+
+
+def demand_pressure_label(forecast_value, baseline_value):
+    if baseline_value <= 0:
+        return "Normal"
+
+    change_percent = ((forecast_value - baseline_value) / baseline_value) * 100
+    if change_percent >= 20:
+        return "High Prep"
+    if change_percent >= 8:
+        return "Watch"
+    if change_percent <= -12:
+        return "Light Prep"
+    return "Normal"
+
+
+def build_manager_checklist(forecast_value, baseline_value, peak_day, selected_combo, selected_product):
+    pressure = demand_pressure_label(forecast_value, baseline_value)
+    checklist = []
+
+    if pressure == "High Prep":
+        checklist.append("Increase chicken, rice, and drink prep before peak service.")
+        checklist.append("Assign extra staff for cashier and packing during busy hours.")
+    elif pressure == "Watch":
+        checklist.append("Prepare a moderate stock buffer and monitor rush-hour orders.")
+    elif pressure == "Light Prep":
+        checklist.append("Keep production lean to avoid over-prep and wastage.")
+    else:
+        checklist.append("Follow normal prep levels and watch live sales movement.")
+
+    checklist.append(f"Push combo suggestion: {selected_product} + {selected_combo}.")
+    checklist.append(f"Use {peak_day} as the main staffing and procurement checkpoint.")
+    return pressure, checklist
 
 
 # =========================
@@ -844,15 +981,41 @@ st.markdown(
 # =========================
 page_labels = {
     "Dashboard": "Demand Kitchen",
+    "AI Manager Report": "AI Manager Brief",
+    "Model Performance": "Model Performance",
     "Combo Control": "Combo Counter",
-    "AI Restocking Demo": "Stock Planner"
+    "AI Restocking Demo": "Stock Planner",
+    "Alert Center": "Alert Center"
 }
+
+if "page_nav" not in st.session_state:
+    st.session_state["page_nav"] = "Dashboard"
+
+LANDING_PAGE_URL = "http://127.0.0.1:5173/"
+
+st.sidebar.link_button(
+    "Home",
+    LANDING_PAGE_URL,
+    icon=":material/home:",
+    width="stretch"
+)
+st.sidebar.divider()
 
 page = st.sidebar.radio(
     "Navigation",
-    ["Dashboard", "Combo Control", "AI Restocking Demo"],
+    [
+        "Dashboard",
+        "AI Manager Report",
+        "Model Performance",
+        "Combo Control",
+        "AI Restocking Demo",
+        "Alert Center"
+    ],
+    key="page_nav",
     format_func=lambda value: page_labels[value]
 )
+
+st.sidebar.caption(f"Current Page: {page_labels[page]}")
 
 st.sidebar.divider()
 st.sidebar.caption("Currency Mode")
@@ -1175,6 +1338,212 @@ if page == "Dashboard":
                 style_axis(ax)
                 plt.xticks(rotation=45)
                 st.pyplot(fig)
+
+
+# =========================
+# AI MANAGER REPORT PAGE
+# =========================
+if page == "AI Manager Report":
+
+    st.header("AI Manager Brief")
+    st.write("Daily operation brief for sales demand, staffing pressure, combo action, and procurement focus.")
+
+    st.divider()
+
+    outlets = sorted(df["Outlet"].dropna().unique())
+    products = sorted(df["Nama Produk"].dropna().unique())
+    default_product = top_product_by_quantity()
+    default_product_index = products.index(default_product) if default_product in products else 0
+
+    b1, b2, b3 = st.columns(3)
+
+    with b1:
+        brief_outlet = st.selectbox("Brief Outlet", outlets)
+
+    with b2:
+        brief_date = st.date_input("Brief Date", value=datetime.today())
+
+    with b3:
+        focus_product = st.selectbox("Focus Menu Item", products, index=default_product_index)
+
+    combo_df = get_product_combo(focus_product, 5)
+    focus_combo = combo_df["Recommended Combo Item"].iloc[0] if len(combo_df) > 0 else "No combo found"
+
+    brief_dates = pd.date_range(pd.to_datetime(brief_date).normalize(), periods=7, freq="D")
+    total_forecast = predict_total_sales_for_dates(brief_dates)
+    outlet_forecast = [
+        get_outlet_prediction(value, brief_outlet)
+        for value in total_forecast
+    ]
+    brief_df = pd.DataFrame({
+        "Date": brief_dates,
+        "Outlet Forecast IDR": outlet_forecast
+    })
+    brief_df["Outlet Forecast MYR"] = brief_df["Outlet Forecast IDR"].apply(convert_idr_to_myr)
+
+    daily_history = get_daily_sales_history(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    )
+    outlet_share = get_outlet_share(
+        len(df),
+        str(DATA_MIN_DATE.date()),
+        str(DATA_MAX_DATE.date())
+    ).get(brief_outlet, 0)
+    outlet_baseline = daily_history.mean() * outlet_share
+    today_forecast = brief_df["Outlet Forecast IDR"].iloc[0]
+    peak_row = brief_df.loc[brief_df["Outlet Forecast IDR"].idxmax()]
+    pressure_label, checklist = build_manager_checklist(
+        today_forecast,
+        outlet_baseline,
+        peak_row["Date"].strftime("%d %b"),
+        focus_combo,
+        focus_product
+    )
+
+    _, _, brief_mape, _ = evaluate_sales_model(90)
+    confidence_label = model_health_label(brief_mape)
+
+    m1, m2, m3, m4 = st.columns(4)
+
+    with m1:
+        st.metric("Today Forecast", rm(today_forecast))
+
+    with m2:
+        st.metric("Prep Pressure", pressure_label)
+
+    with m3:
+        st.metric("Peak Day", peak_row["Date"].strftime("%d %b"))
+
+    with m4:
+        st.metric("Model Health", confidence_label)
+
+    st.markdown(f"""
+    <div class="forecast-card accent-mint">
+        <div class="badge">AI Daily Brief</div>
+        <div class="forecast-title">{safe_html(brief_outlet)}</div>
+        <p class="forecast-desc">Expected demand: <b>{rm(today_forecast)}</b></p>
+        <p class="forecast-desc">Recommended combo: <b>{safe_html(focus_product)} + {safe_html(focus_combo)}</b></p>
+        <p class="forecast-desc">Forecast horizon: <b>{safe_html(forecast_horizon_note(brief_date))}</b></p>
+        <p class="forecast-desc">Confidence signal: <b>{safe_html(confidence_label)} based on latest replay MAPE {brief_mape:.2f}%</b></p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.subheader("Manager Action Checklist")
+    for item in checklist:
+        st.checkbox(item, value=False)
+
+    st.subheader("7-Day Outlet Forecast")
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(
+        brief_df["Date"],
+        brief_df["Outlet Forecast MYR"],
+        marker="o",
+        color="#2fd6a3",
+        linewidth=2.4,
+        label="Outlet forecast"
+    )
+    ax.set_title(f"7-Day Manager Forecast - {brief_outlet}")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Sales (MYR)")
+    ax.legend()
+    style_axis(ax)
+    plt.xticks(rotation=25)
+    st.pyplot(fig)
+
+    brief_display = brief_df[["Date", "Outlet Forecast MYR"]].copy()
+    brief_display["Outlet Forecast MYR"] = brief_display["Outlet Forecast MYR"].apply(format_myr)
+    st.dataframe(brief_display, width="stretch")
+
+    checklist_text = "\n- ".join(checklist)
+    brief_message = f"""
+AI Manager Brief
+
+Outlet: {brief_outlet}
+Date: {pd.to_datetime(brief_date).strftime('%d %b %Y')}
+Today Forecast: {rm(today_forecast)}
+Prep Pressure: {pressure_label}
+Peak Day: {peak_row['Date'].strftime('%d %b %Y')}
+Combo Action: {focus_product} + {focus_combo}
+Model Health: {confidence_label} ({brief_mape:.2f}% replay MAPE)
+
+Checklist:
+- {checklist_text}
+"""
+
+    st.text_area("Manager Brief Message", brief_message, height=260)
+
+    if st.button("Save Manager Brief To Alert Center"):
+        add_alert_center_event(
+            brief_outlet,
+            "AI Manager Brief",
+            "SAVED",
+            "Dashboard",
+            pressure_label,
+            brief_message,
+            [{"Action": item} for item in checklist]
+        )
+        st.success("Manager brief saved to Alert Center.")
+
+
+# =========================
+# MODEL PERFORMANCE PAGE
+# =========================
+if page == "Model Performance":
+
+    st.header("Model Performance")
+    st.write("Historical replay view for checking how close the sales forecasting model is to actual demand.")
+
+    st.divider()
+
+    evaluation_days = st.slider("Evaluation Window (days)", 30, 180, 90, 15)
+    eval_df, mae, mape, r2 = evaluate_sales_model(evaluation_days)
+    health = model_health_label(mape)
+
+    p1, p2, p3, p4 = st.columns(4)
+
+    with p1:
+        st.metric("Replay MAPE", f"{mape:.2f}%")
+
+    with p2:
+        st.metric("MAE", rm(mae))
+
+    with p3:
+        st.metric("R2 Score", f"{r2:.3f}")
+
+    with p4:
+        st.metric("Model Health", health)
+
+    eval_df["Actual Sales MYR"] = eval_df["Actual Sales IDR"].apply(convert_idr_to_myr)
+    eval_df["Predicted Sales MYR"] = eval_df["Predicted Sales IDR"].apply(convert_idr_to_myr)
+    eval_df["Abs Error MYR"] = eval_df["Abs Error IDR"].apply(convert_idr_to_myr)
+
+    fig, ax = plt.subplots(figsize=(11, 4.5))
+    ax.plot(eval_df["Date"], eval_df["Actual Sales MYR"], color="#2fd6a3", label="Actual")
+    ax.plot(eval_df["Date"], eval_df["Predicted Sales MYR"], color="#ff5a3d", label="Predicted")
+    ax.set_title(f"Actual vs Predicted Sales - Latest {evaluation_days} Days")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Sales (MYR)")
+    ax.legend()
+    style_axis(ax)
+    plt.xticks(rotation=25)
+    st.pyplot(fig)
+
+    st.subheader("Worst Error Days")
+    worst_days = eval_df.sort_values("Abs Error IDR", ascending=False).head(10)[
+        ["Date", "Actual Sales MYR", "Predicted Sales MYR", "Abs Error MYR"]
+    ].copy()
+    for col in ["Actual Sales MYR", "Predicted Sales MYR", "Abs Error MYR"]:
+        worst_days[col] = worst_days[col].apply(format_myr)
+    st.dataframe(worst_days, width="stretch")
+
+    st.info(
+        "Use this page during viva to defend the model with replay metrics. "
+        "For final report, mention that a true holdout split is stronger if the model is retrained."
+    )
+
 
 # =========================
 # COMBO CONTROL PAGE
@@ -1655,6 +2024,25 @@ Main Suggestion:
         if auto_alert_enabled:
             if selected_chat_id is None:
                 st.warning("Auto alert is enabled, but no Telegram user is registered yet.")
+                if len(auto_alert_items) > 0:
+                    auto_alert_key = build_auto_alert_key(
+                        selected_company,
+                        simulated_today,
+                        forecast_year,
+                        forecast_month,
+                        auto_alert_threshold,
+                        auto_alert_items
+                    )
+                    add_alert_center_event(
+                        selected_company,
+                        "Auto procurement alert pending",
+                        "PENDING",
+                        "Dashboard",
+                        auto_alert_items["Priority"].iloc[0],
+                        telegram_message,
+                        auto_alert_items.to_dict("records"),
+                        dedupe_key=f"pending-{auto_alert_key}"
+                    )
             elif len(auto_alert_items) == 0:
                 st.success("Auto alert is enabled. No item reached the selected risk threshold.")
             else:
@@ -1691,7 +2079,29 @@ Main Suggestion:
                             "items": auto_alert_items.to_dict("records")
                         }
                         save_auto_alert_state(auto_alert_state)
+                        add_alert_center_event(
+                            selected_company,
+                            "Auto procurement alert sent",
+                            "SENT",
+                            "Telegram",
+                            auto_alert_items["Priority"].iloc[0],
+                            auto_telegram_message,
+                            auto_alert_items.to_dict("records"),
+                            dedupe_key=f"sent-{auto_alert_key}"
+                        )
                         st.success("Auto Telegram alert sent because risk threshold was reached.")
+                    else:
+                        add_alert_center_event(
+                            selected_company,
+                            "Telegram failed - fallback alert saved",
+                            "FAILED",
+                            "Telegram",
+                            auto_alert_items["Priority"].iloc[0],
+                            auto_telegram_message,
+                            auto_alert_items.to_dict("records"),
+                            dedupe_key=f"failed-{auto_alert_key}"
+                        )
+                        st.warning("Telegram failed, so the alert was saved in Alert Center.")
         else:
             st.info("Auto alert is off. Manual Telegram sending is still available.")
 
@@ -1701,6 +2111,137 @@ Main Suggestion:
             if st.button("Send Telegram AI Restocking Alert"):
                 sent = send_telegram_alert(selected_chat_id, telegram_message)
                 if sent:
+                    add_alert_center_event(
+                        selected_company,
+                        "Manual procurement alert sent",
+                        "SENT",
+                        "Telegram",
+                        risky_items["Priority"].iloc[0] if len(risky_items) > 0 else "INFO",
+                        telegram_message,
+                        risky_items.to_dict("records")
+                    )
                     st.success("Telegram AI restocking alert sent successfully.")
+                else:
+                    add_alert_center_event(
+                        selected_company,
+                        "Manual Telegram failed - fallback alert saved",
+                        "FAILED",
+                        "Telegram",
+                        risky_items["Priority"].iloc[0] if len(risky_items) > 0 else "INFO",
+                        telegram_message,
+                        risky_items.to_dict("records")
+                    )
+                    st.warning("Telegram failed, so the manual alert was saved in Alert Center.")
         else:
             st.info("Register a Telegram user first before sending alert.")
+
+
+# =========================
+# ALERT CENTER PAGE
+# =========================
+if page == "Alert Center":
+
+    st.header("Alert Center")
+    st.write("Fallback inbox for procurement alerts, Telegram failures, saved manager briefs, and resend actions.")
+
+    st.divider()
+
+    alerts = load_alert_center()
+
+    if len(alerts) == 0:
+        st.success("No alerts stored yet.")
+    else:
+        alert_df = pd.DataFrame(alerts)
+
+        s1, s2, s3, s4 = st.columns(4)
+
+        with s1:
+            st.metric("Total Alerts", len(alert_df))
+
+        with s2:
+            st.metric("Pending", len(alert_df[alert_df["status"] == "PENDING"]))
+
+        with s3:
+            st.metric("Failed", len(alert_df[alert_df["status"] == "FAILED"]))
+
+        with s4:
+            st.metric("Sent/Saved", len(alert_df[alert_df["status"].isin(["SENT", "SAVED", "RESENT"])]))
+
+        status_options = ["All"] + sorted(alert_df["status"].dropna().unique().tolist())
+        selected_status = st.selectbox("Filter Status", status_options)
+
+        display_alerts = alert_df.copy()
+        if selected_status != "All":
+            display_alerts = display_alerts[display_alerts["status"] == selected_status]
+
+        st.dataframe(
+            display_alerts[
+                ["created_at", "company", "title", "status", "channel", "severity", "id"]
+            ],
+            width="stretch"
+        )
+
+        alert_options = [
+            f"{alert['id']} | {alert['status']} | {alert['title']}"
+            for alert in alerts
+        ]
+        selected_alert_label = st.selectbox("Open Alert", alert_options)
+        selected_alert_id = selected_alert_label.split(" | ")[0]
+        selected_alert = next(alert for alert in alerts if alert["id"] == selected_alert_id)
+
+        st.markdown(f"""
+        <div class="forecast-card accent-steel">
+            <div class="badge">{safe_html(selected_alert.get('status', 'ALERT'))}</div>
+            <div class="forecast-title">{safe_html(selected_alert.get('title', 'Alert'))}</div>
+            <p class="forecast-desc">Company: <b>{safe_html(selected_alert.get('company', '-'))}</b></p>
+            <p class="forecast-desc">Channel: <b>{safe_html(selected_alert.get('channel', '-'))}</b></p>
+            <p class="forecast-desc">Severity: <b>{safe_html(selected_alert.get('severity', '-'))}</b></p>
+            <p class="forecast-desc">Created: <b>{safe_html(selected_alert.get('created_at', '-'))}</b></p>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.text_area("Alert Message", selected_alert.get("message", ""), height=320)
+
+        selected_items = selected_alert.get("items", [])
+        if len(selected_items) > 0:
+            st.subheader("Alert Items")
+            st.dataframe(pd.DataFrame(selected_items), width="stretch")
+
+        st.divider()
+        st.subheader("Fallback Actions")
+
+        registered_users = load_registered_users()
+        resendable = selected_alert.get("status") in ["FAILED", "PENDING"]
+
+        if resendable:
+            if len(registered_users) == 0:
+                st.warning("No Telegram user registered. The alert remains available inside the dashboard.")
+            else:
+                default_company = selected_alert.get("company")
+                user_names = list(registered_users.keys())
+                default_index = user_names.index(default_company) if default_company in user_names else 0
+                resend_company = st.selectbox("Resend To", user_names, index=default_index)
+
+                if st.button("Resend Selected Alert To Telegram"):
+                    sent = send_telegram_alert(
+                        registered_users[resend_company]["chat_id"],
+                        selected_alert.get("message", "")
+                    )
+                    if sent:
+                        for alert in alerts:
+                            if alert["id"] == selected_alert_id:
+                                alert["status"] = "RESENT"
+                                alert["channel"] = "Telegram"
+                                alert["resent_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                alert["company"] = resend_company
+                                break
+                        save_alert_center(alerts)
+                        st.success("Alert resent successfully.")
+                    else:
+                        st.error("Telegram resend failed. Alert is still saved in Alert Center.")
+        else:
+            st.info("This alert does not need a resend action.")
+
+        if st.button("Clear Alert Center"):
+            save_alert_center([])
+            st.success("Alert Center cleared.")

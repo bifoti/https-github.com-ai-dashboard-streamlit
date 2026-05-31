@@ -2,3 +2,4 @@ __pycache__/
 *.py[cod]
 latest_restocking_alert.json
 auto_alert_state.json
+alert_center.json
