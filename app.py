@@ -1148,7 +1148,7 @@ page_labels = {
 if "page_nav" not in st.session_state:
     st.session_state["page_nav"] = "Dashboard"
 
-LANDING_PAGE_URL = "http://127.0.0.1:5173/"
+LANDING_PAGE_URL = "http://150.109.93.27:8501/"
 
 st.sidebar.link_button(
     "Home",
